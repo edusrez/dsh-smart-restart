@@ -62,6 +62,8 @@ export interface BuildNoticeOptions {
   downtimeMs: number;
   /** Optional fully-own notice; returned verbatim when provided. */
   customNotice?: string;
+  /** Optional human reason recorded by the smart_restart tool caller. */
+  reason?: string;
 }
 
 /** Build the agent-facing restart notice. A customNotice wins verbatim. */
@@ -71,6 +73,9 @@ export function buildNotice(opts: BuildNoticeOptions): string {
   let text = `Smart-restart: the DSH service restarted at ${opts.bootAt}.`;
   if (opts.prevBootAt) {
     text += ` Previous boot: ${opts.prevBootAt} (downtime ~${humanizeDowntime(opts.downtimeMs)}).`;
+  }
+  if (opts.reason) {
+    text += ` reason: ${opts.reason}.`;
   }
   text += ` If a task was in progress, resume it; otherwise reply with a one-line acknowledgment.`;
   return text;
@@ -92,4 +97,66 @@ export function targetsAgent(
   if (target === 'primary') return isRoot;
   if (agentSessionId !== undefined) return target === agentSessionId;
   return false;
+}
+
+/** A durable pending notice recorded by the smart_restart tool before restart. */
+export interface PendingNotice {
+  /** Session id that requested the restart; the notice must return to it. */
+  sessionId: string;
+  /** Optional human reason recorded alongside the request. */
+  reason: string;
+}
+
+/** Arguments accepted by the smart_restart tool. */
+export interface SmartRestartParams {
+  /** Optional human-readable note included in the post-restart notice. */
+  reason?: string;
+}
+
+/** Result returned by the smart_restart tool. */
+export interface SmartRestartResult {
+  ok: boolean;
+  restarting: boolean;
+  sessionId?: string;
+  reason?: string;
+  error?: string;
+}
+
+/**
+ * Parse a pending-notice JSON document written by the smart_restart tool.
+ * Tolerant of missing/corrupt JSON and a missing reason; requires a non-empty
+ * sessionId. Returns null when the document is not a usable pending notice.
+ */
+export function parsePendingNotice(raw: string): PendingNotice | null {
+  try {
+    const data = JSON.parse(raw) as Partial<PendingNotice>;
+    if (data && typeof data.sessionId === 'string' && data.sessionId.length > 0) {
+      return {
+        sessionId: data.sessionId,
+        reason: typeof data.reason === 'string' ? data.reason : '',
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decide whether this agent should receive the restart notice on this boot.
+ *
+ * A pinned target (set from a pending notice left by the smart_restart tool)
+ * overrides the configured `target` entirely: only the pinned session wins.
+ * Without a pinned target, the existing `target` matching applies.
+ */
+export function selectsAgent(
+  pinnedTarget: string | undefined,
+  target: string,
+  agentSessionId: string | undefined,
+  isRoot: boolean,
+): boolean {
+  if (pinnedTarget) {
+    return agentSessionId !== undefined && pinnedTarget === agentSessionId;
+  }
+  return targetsAgent(target, agentSessionId, isRoot);
 }

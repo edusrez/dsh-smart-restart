@@ -43,6 +43,25 @@ test('buildNotice: omits previous boot line when prevBootAt absent', () => {
   assert.doesNotMatch(out, /Previous boot/)
 })
 
+test('buildNotice: includes reason before the resume instruction', () => {
+  const out = buildNotice({
+    bootAt: '2026-08-18T12:00:00.000Z',
+    downtimeMs: 60000,
+    reason: 'installed dshmarket in stable+dev',
+  })
+  assert.match(out, /reason: installed dshmarket in stable\+dev\./)
+  assert.match(out, /If a task was in progress, resume it/)
+  // reason must come BEFORE the resume sentence
+  const reasonIdx = out.indexOf('reason: installed dshmarket in stable+dev')
+  const resumeIdx = out.indexOf('If a task was in progress, resume it')
+  assert.ok(reasonIdx > -1 && resumeIdx > -1 && reasonIdx < resumeIdx)
+})
+
+test('buildNotice: omits reason line when reason absent', () => {
+  const out = buildNotice({ bootAt: '2026-08-18T12:00:00.000Z', downtimeMs: 60000 })
+  assert.doesNotMatch(out, /reason:/)
+})
+
 test('humanizeDowntime: <1s', () => {
   assert.equal(humanizeDowntime(0), '<1s')
   assert.equal(humanizeDowntime(999), '<1s')

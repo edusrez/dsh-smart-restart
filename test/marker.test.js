@@ -2,7 +2,7 @@
 // integration check against the compiled plugin (lib/index.js).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { detectRestart, targetsAgent } from '../lib/boot.js'
+import { detectRestart, parsePendingNotice, selectsAgent, targetsAgent } from '../lib/boot.js'
 
 const NOW = Date.parse('2026-08-18T12:00:00.000Z')
 const PREV = Date.parse('2026-08-18T11:59:00.000Z') // 60_000 ms before NOW
@@ -50,6 +50,45 @@ test('targetsAgent: explicit session id matches by exact string', () => {
   assert.equal(targetsAgent('asistente', 'AsisteNte', false), false)
   assert.equal(targetsAgent('asistente', undefined, true), false)
   assert.equal(targetsAgent('asistente', 'other', false), false)
+})
+
+// --- v0.2.0: pending-notice parsing + pinned target selection ---------------
+
+test('parsePendingNotice: valid doc with reason', () => {
+  const raw = JSON.stringify({ sessionId: 'session-abc', reason: 'installed dshmarket', when: 'x' })
+  assert.deepEqual(parsePendingNotice(raw), { sessionId: 'session-abc', reason: 'installed dshmarket' })
+})
+
+test('parsePendingNotice: missing reason defaults to empty string', () => {
+  const raw = JSON.stringify({ sessionId: 'session-abc' })
+  assert.deepEqual(parsePendingNotice(raw), { sessionId: 'session-abc', reason: '' })
+})
+
+test('parsePendingNotice: corrupt JSON returns null', () => {
+  assert.equal(parsePendingNotice('not json'), null)
+})
+
+test('parsePendingNotice: missing/empty sessionId returns null', () => {
+  assert.equal(parsePendingNotice('{}'), null)
+  assert.equal(parsePendingNotice(JSON.stringify({ sessionId: '' })), null)
+})
+
+test('selectsAgent: no pinned target falls back to targetsAgent', () => {
+  assert.equal(selectsAgent(undefined, 'primary', 'root-1', true), true)
+  assert.equal(selectsAgent(undefined, 'primary', 'child-1', false), false)
+  assert.equal(selectsAgent(undefined, 'all', 'root-1', false), true)
+})
+
+test('selectsAgent: pinned target overrides target and wins only for that session', () => {
+  const pinned = 'session-abc'
+  // pinned session matches regardless of the configured target
+  assert.equal(selectsAgent(pinned, 'primary', 'session-abc', false), true)
+  assert.equal(selectsAgent(pinned, 'all', 'session-abc', false), true)
+  // any other session is excluded even for roots / 'all'
+  assert.equal(selectsAgent(pinned, 'all', 'root-1', true), false)
+  assert.equal(selectsAgent(pinned, 'primary', 'root-1', true), false)
+  // a root that IS the pinned session still matches
+  assert.equal(selectsAgent(pinned, 'primary', pinned, true), true)
 })
 
 // --- Small integration check against the compiled plugin -------------------

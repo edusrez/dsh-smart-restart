@@ -8,3 +8,9 @@
         target: primary
         wakeup: true
         notice: ''
+        # systemd unit to restart when the smart_restart tool is invoked
+        # (e.g. "dsh.service" or "dsh-deepartments-dev.service"); leave empty
+        # to disable restarting and make the tool fail safe.
+        restartUnit: ''
+        # whether to register the smart_restart tool (default true).
+        toolEnabled: true
