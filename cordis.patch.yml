@@ -1,0 +1,10 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+- insert:
+    - id: smart-restart
+      name: dsh-smart-restart
+      config:
+        enabled: true
+        stateDir: .smart-restart
+        target: primary
+        wakeup: true
+        notice: ''
