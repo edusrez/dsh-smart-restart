@@ -14,3 +14,7 @@
         restartUnit: ''
         # whether to register the smart_restart tool (default true).
         toolEnabled: true
+        # grace window (ms, default 10 min) before shutdown within which last
+        # agent activity counts as "agent-involved" for the smart shutdown
+        # auto-notification (boot pins to that session instead of `target`).
+        shutdownGraceMs: 600000

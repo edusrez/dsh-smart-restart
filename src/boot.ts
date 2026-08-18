@@ -160,3 +160,71 @@ export function selectsAgent(
   }
   return targetsAgent(target, agentSessionId, isRoot);
 }
+
+/**
+ * A durable shutdown notice persisted on SIGTERM/SIGINT by the running process
+ * so the NEXT boot can detect that the process stopped while an agent session
+ * was active — and auto-notify that session without requiring the smart_restart
+ * tool to have been invoked.
+ */
+export interface ShutdownNotice {
+  /** Session id that was last active just before the process went down. */
+  lastSessionId: string;
+  /** ISO timestamp of that last activity. */
+  lastActiveAt: string;
+  /** ISO timestamp of when the shutdown notice was written. */
+  when: string;
+}
+
+/**
+ * Parse a shutdown-notice JSON document written by the SIGTERM/SIGINT handler.
+ * Tolerant of missing/corrupt JSON; requires a non-empty `lastSessionId` and a
+ * parseable `lastActiveAt` timestamp. Returns null when the document is not a
+ * usable shutdown notice.
+ */
+export function parseShutdownNotice(raw: string): ShutdownNotice | null {
+  try {
+    const data = JSON.parse(raw) as Partial<ShutdownNotice>;
+    if (
+      data &&
+      typeof data.lastSessionId === 'string' &&
+      data.lastSessionId.length > 0 &&
+      typeof data.lastActiveAt === 'string' &&
+      Number.isFinite(Date.parse(data.lastActiveAt))
+    ) {
+      return {
+        lastSessionId: data.lastSessionId,
+        lastActiveAt: data.lastActiveAt,
+        when: typeof data.when === 'string' ? data.when : '',
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decide which session the shutdown notice should be pinned to, if any.
+ *
+ * A notice present on boot means the process was stopped while at least one
+ * session was active. It returns the last-active session id ONLY if that
+ * session was active within `graceMs` of the shutdown (recent activity ⇒ the
+ * user likely restarted while an agent was mid-task, so auto-notify). When the
+ * last activity predates the whole grace window the session was idle well
+ * before shutdown (the user probably restarted while idle), so we return null
+ * and let the caller fall back to the existing `target`.
+ *
+ * Guards: null notice → null; an unbounded/NaN shutdown time → null.
+ */
+export function shutdownTarget(
+  notice: ShutdownNotice | null,
+  shutdownAtMs: number,
+  graceMs: number,
+): string | null {
+  if (!notice) return null;
+  const lastActiveAtMs = Date.parse(notice.lastActiveAt);
+  if (!Number.isFinite(lastActiveAtMs) || !Number.isFinite(shutdownAtMs)) return null;
+  if (shutdownAtMs - lastActiveAtMs <= graceMs) return notice.lastSessionId;
+  return null;
+}

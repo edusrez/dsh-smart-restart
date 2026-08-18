@@ -2,7 +2,7 @@
 // integration check against the compiled plugin (lib/index.js).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { detectRestart, parsePendingNotice, selectsAgent, targetsAgent } from '../lib/boot.js'
+import { detectRestart, parsePendingNotice, parseShutdownNotice, selectsAgent, shutdownTarget, targetsAgent } from '../lib/boot.js'
 
 const NOW = Date.parse('2026-08-18T12:00:00.000Z')
 const PREV = Date.parse('2026-08-18T11:59:00.000Z') // 60_000 ms before NOW
@@ -89,6 +89,72 @@ test('selectsAgent: pinned target overrides target and wins only for that sessio
   assert.equal(selectsAgent(pinned, 'primary', 'root-1', true), false)
   // a root that IS the pinned session still matches
   assert.equal(selectsAgent(pinned, 'primary', pinned, true), true)
+})
+
+// --- v0.3.0: smart shutdown auto-detection (parseShutdownNotice / shutdownTarget)
+
+test('parseShutdownNotice: valid doc parses', () => {
+  const raw = JSON.stringify({
+    lastSessionId: 'session-abc',
+    lastActiveAt: '2026-08-18T11:59:30.000Z',
+    when: '2026-08-18T12:00:00.000Z',
+  })
+  assert.deepEqual(parseShutdownNotice(raw), {
+    lastSessionId: 'session-abc',
+    lastActiveAt: '2026-08-18T11:59:30.000Z',
+    when: '2026-08-18T12:00:00.000Z',
+  })
+})
+
+test('parseShutdownNotice: missing when defaults to empty string', () => {
+  const raw = JSON.stringify({ lastSessionId: 's1', lastActiveAt: '2026-08-18T12:00:00.000Z' })
+  assert.deepEqual(parseShutdownNotice(raw), {
+    lastSessionId: 's1',
+    lastActiveAt: '2026-08-18T12:00:00.000Z',
+    when: '',
+  })
+})
+
+test('parseShutdownNotice: missing/empty lastSessionId returns null', () => {
+  assert.equal(parseShutdownNotice('{}'), null)
+  assert.equal(parseShutdownNotice(JSON.stringify({ lastSessionId: '', lastActiveAt: '2026-08-18T12:00:00.000Z' })), null)
+})
+
+test('parseShutdownNotice: corrupt JSON returns null', () => {
+  assert.equal(parseShutdownNotice('not json'), null)
+})
+
+test('parseShutdownNotice: unparseable lastActiveAt returns null', () => {
+  const raw = JSON.stringify({ lastSessionId: 's1', lastActiveAt: 'not-a-date' })
+  assert.equal(parseShutdownNotice(raw), null)
+})
+
+test('shutdownTarget: null notice returns null', () => {
+  assert.equal(shutdownTarget(null, NOW, 600_000), null)
+})
+
+test('shutdownTarget: active within grace returns the session', () => {
+  const notice = { lastSessionId: 'session-abc', lastActiveAt: new Date(NOW - 30_000).toISOString(), when: '' }
+  assert.equal(shutdownTarget(notice, NOW, 600_000), 'session-abc')
+})
+
+test('shutdownTarget: activity exactly at the grace boundary returns the session', () => {
+  // lastActiveAt exactly graceMs before shutdown is still "within" the window
+  const notice = { lastSessionId: 'session-abc', lastActiveAt: new Date(NOW - 600_000).toISOString(), when: '' }
+  assert.equal(shutdownTarget(notice, NOW, 600_000), 'session-abc')
+})
+
+test('shutdownTarget: inactive beyond grace returns null', () => {
+  const notice = { lastSessionId: 'session-abc', lastActiveAt: new Date(NOW - 601_000).toISOString(), when: '' }
+  assert.equal(shutdownTarget(notice, NOW, 600_000), null)
+})
+
+test('shutdownTarget: NaN guards return null', () => {
+  const notice = { lastSessionId: 'session-abc', lastActiveAt: 'bad-date', when: '' }
+  assert.equal(shutdownTarget(notice, NOW, 600_000), null)
+  assert.equal(shutdownTarget(notice, NaN, 600_000), null)
+  // undefined shutdown time -> NaN
+  assert.equal(shutdownTarget(notice, Number.NaN, 600_000), null)
 })
 
 // --- Small integration check against the compiled plugin -------------------

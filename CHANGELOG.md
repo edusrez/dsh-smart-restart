@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-18
+
+### Fixed
+
+- SIGTERM/SIGINT handler now re-raises the signal after writing the shutdown notice (previously the handler suppressed the default termination, which would stall systemd restarts until TimeoutStopSec — found in an isolated live smoke before release).
+
+### Added
+
+- **Smart shutdown auto-detection**: the plugin now tracks the **last active session** (refreshed on `agent/session-start` and `agent/pre-step`) and, on `SIGTERM`/`SIGINT`, synchronously persists a durable `shutdown-notice.json` (`{lastSessionId, lastActiveAt, when}`) under the state dir before the process dies. On the next boot, if there was **no** `pending-notice.json`, the plugin reads that notice and **pins** the post-restart notice to the last-active session when it was active within `shutdownGraceMs`. This auto-notifies the agent that was active when the process went down — so a **plain `systemctl restart`** run by the agent (or while an agent was active) notifies that session at boot without the user prompting.
+- **`shutdownGraceMs` config** (default `600000` = 10 minutes): the window before shutdown within which last agent activity must fall for the shutdown-notice to be considered "agent-involved". If the session was idle beyond the grace window (the user probably restarted while idle), the pin is skipped and delivery falls back to `target`.
+- **Boot pinning priority** for the post-restart notice: `pending-notice.json` (the `smart_restart` tool) **wins**; otherwise `shutdown-notice.json` (auto-detected last-active session, subject to `shutdownGraceMs`); otherwise nothing pinned and delivery uses the existing `target`/primary fallback. The shutdown notice is consumed (unlinked) after being read.
+- Pure-logic unit tests for `parseShutdownNotice` (valid/missing/corrupt/empty `lastSessionId`/unparseable timestamp) and `shutdownTarget` (within grace → session; exactly at boundary → session; beyond grace → null; null notice → null; NaN guard → null).
+
+### Changed
+
+- Boot delivery now treats a **smart-shutdown auto-detected session** as a second-priority pin, behind the tool-caller pending notice and ahead of the `target` fallback.
+- `SIGTERM`/`SIGINT` handlers and the activity trackers are reversible via `ctx.effect` (removed on plugin unload / HMR); the only intentional durable artifacts remain the marker and the notice files that must survive the restart they document.
+
 ## [0.2.0] - 2026-08-18
 
 ### Added

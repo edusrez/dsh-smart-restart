@@ -37,8 +37,11 @@ import {
   buildNotice,
   detectRestart,
   parsePendingNotice,
+  parseShutdownNotice,
   selectsAgent,
+  shutdownTarget,
   type BootMarker,
+  type ShutdownNotice,
   type SmartRestartParams,
   type SmartRestartResult,
 } from './boot.js'
@@ -51,6 +54,9 @@ export interface Config {
   notice: string
   restartUnit: string
   toolEnabled: boolean
+  /** Grace window (ms) before shutdown within which last agent activity counts
+   *  as "agent-involved" for the smart shutdown auto-notification. */
+  shutdownGraceMs: number
 }
 
 const DEFAULTS: Config = {
@@ -61,6 +67,7 @@ const DEFAULTS: Config = {
   notice: '',
   restartUnit: '',
   toolEnabled: true,
+  shutdownGraceMs: 600_000, // 10 minutes
 }
 
 /** Fallback poll interval while waiting for a pinned session to resume. */
@@ -150,10 +157,61 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     // file absent or already removed; fine
   }
 
+  // --- 2c. Smart shutdown auto-detection (second-priority pin). -----------
+  // If NO pending notice exists (the restart was NOT triggered via the
+  // smart_restart tool — e.g. a plain `systemctl restart` executed by the
+  // agent, or while an agent was active), the SIGTERM/SIGINT handler persisted
+  // a shutdown-notice.json recording the last active session. Pin delivery to
+  // that session ONLY if it was active within `shutdownGraceMs` of shutdown
+  // (recent activity ⇒ the user restarted while the agent was mid-task, so
+  // auto-notify). If the session was idle well before shutdown, `shutdownTarget`
+  // returns null and we fall back to the existing `target`. The file is consumed
+  // (unlinked) so it cannot linger and pin a future boot; the marker still
+  // proves the restart.
+  const shutdownPath = join(markerDir, 'shutdown-notice.json')
+  if (!pinnedTarget) {
+    try {
+      const notice = parseShutdownNotice(readFileSync(shutdownPath, 'utf8'))
+      const target = shutdownTarget(notice, Date.now(), config.shutdownGraceMs)
+      if (target) {
+        pinnedTarget = target
+        pinnedReason = 'the process was stopped while this session was active'
+        console.log('[smart-restart] pinned restart notice to last-active session', pinnedTarget)
+      }
+    } catch {
+      // no readable shutdown notice -> nothing to pin
+    }
+    try {
+      unlinkSync(shutdownPath)
+    } catch {
+      // file absent or already removed; fine
+    }
+  } else {
+    // A pending notice won priority; still consume any stale shutdown-notice
+    // so it cannot pin a later boot.
+    try {
+      unlinkSync(shutdownPath)
+    } catch {
+      // file absent or already removed; fine
+    }
+  }
+
   // --- 3. Delivery plumbing (all state is apply-scoped; nothing global). ---
   const deliveredIds = new Set<string>()
   let deliveredPrimary = false
   let deliveredAny = false
+
+  // --- 3b. Smart shutdown activity tracking (apply-scoped). ---------------
+  // Track the last active session so that, if this process is stopped by a
+  // plain SIGTERM/SIGINT (a restart NOT triggered through the smart_restart
+  // tool, or a restart while an agent was active), the shutdown hook below can
+  // record which session to auto-notify on the next boot.
+  let lastActiveId: string | undefined
+  let lastActiveAt = 0
+  const recordActivity = (agent: Agent) => {
+    lastActiveId = String(agent.id)
+    lastActiveAt = Date.now()
+  }
 
   function deliver(agent: Agent): boolean {
     const sid = String(agent.id)
@@ -210,6 +268,9 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
 
   // --- 4. Primary hook: wake on the startup session-start publication. ----
   ctx.on('agent/session-start', ({ agent, source }) => {
+    // Track last activity for the smart shutdown auto-notification (any agent,
+    // any source, regardless of restart state).
+    recordActivity(agent)
     if (!wasRestart || !deliveryPending()) return
     // A pinned target (tool-caller wins) is source-agnostic: a session that
     // RESUMES from a previous process publishes with `source: 'resume'` (not
@@ -220,6 +281,15 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     // A pinned target overrides `config.target` for this boot (tool-caller wins).
     if (!selectsAgent(pinnedTarget, config.target, String(agent.id), isRoot)) return
     deliver(agent)
+  })
+
+  // Any agent proposing a step is "active" — refresh the last-activity stamp so
+  // a shutdown while the agent is mid-task counts as agent-involved.
+  // `agent/pre-step` is a waterfall event: we must call `next()` and return its
+  // decision, passing the messages through unchanged (observation only).
+  ctx.on('agent/pre-step', async ({ agent }, next) => {
+    recordActivity(agent)
+    return next()
   })
 
   function deliveryPending(): boolean {
@@ -290,6 +360,52 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     }
   }, PENDING_POLL_MS)
 
+  // --- 5b. Shutdown hook: persist last-active session for boot auto-notify.
+  // Register SYNCHRONOUS, best-effort SIGTERM/SIGINT handlers that write a
+  // shutdown-notice.json (last active session + timestamp) into the marker dir
+  // before the process dies. This covers restarts NOT initiated via the
+  // smart_restart tool — e.g. a plain `systemctl restart` the agent ran, or a
+  // restart while an agent was active — so the next boot can pin the notice to
+  // that session (only if it was active within shutdownGraceMs). writeFileSync
+  // + mkdirSync are synchronous so they complete under the signal; the write is
+  // wrapped in try/catch and never throws from the handler. Handlers are stored
+  // so they can be removed on unload (reversible).
+  const shutdownDocPath = join(markerDir, 'shutdown-notice.json')
+  const writeShutdownNotice = () => {
+    try {
+      if (!lastActiveId) return // nothing was active; do not write a notice
+      mkdirSync(markerDir, { recursive: true })
+      const doc: ShutdownNotice = {
+        lastSessionId: lastActiveId,
+        lastActiveAt: new Date(lastActiveAt || Date.now()).toISOString(),
+        when: new Date().toISOString(),
+      }
+      writeFileSync(shutdownDocPath, JSON.stringify(doc, null, 2))
+    } catch (err) {
+      // never throw from a signal handler; best-effort only
+      console.warn('[smart-restart] shutdown-notice write failed:', err)
+    }
+  }
+  // NOTE: installing a SIGTERM/SIGINT listener OVERRIDES Node's default
+  // termination action. If the handler only writes and returns, a `systemctl
+  // restart`/`stop` would leave the process alive until systemd's
+  // TimeoutStopSec escalates to SIGKILL (default 90s), breaking restarts of
+  // this very service. So after writing the notice we remove ourselves and
+  // re-raise the signal, letting Node's default action terminate cleanly with
+  // exit code 143 (SIGTERM) / 130 (SIGINT) — discovered via an isolated smoke.
+  const onSigterm = () => {
+    writeShutdownNotice()
+    process.removeListener('SIGTERM', onSigterm)
+    process.kill(process.pid, 'SIGTERM')
+  }
+  const onSigint = () => {
+    writeShutdownNotice()
+    process.removeListener('SIGINT', onSigint)
+    process.kill(process.pid, 'SIGINT')
+  }
+  process.on('SIGTERM', onSigterm)
+  process.on('SIGINT', onSigint)
+
   // --- 6. smart_restart tool (records the calling session, restarts via
   //        systemd detached, then pins the post-restart notice to its session).
   if (config.toolEnabled !== false) {
@@ -336,9 +452,11 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     ctx.effect(() => disposeTool)
   }
 
-  // Reversible effect: drop the listener + interval on plugin unload.
+  // Reversible effect: drop the listener + interval + signal handlers on unload.
   ctx.effect(() => () => {
     clearInterval(pollInterval)
+    process.removeListener('SIGTERM', onSigterm)
+    process.removeListener('SIGINT', onSigint)
   })
 }
 
