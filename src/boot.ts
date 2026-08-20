@@ -205,6 +205,32 @@ export function parseShutdownNotice(raw: string): ShutdownNotice | null {
 }
 
 /**
+ * Whether a session id should be excluded from the "last active" selection.
+ *
+ * Deepartments department heads are now FIRST-CLASS ROOT AGENTS with durable
+ * sessions whose id is `head-<postId>` (e.g. `head-research-head`,
+ * `head-programming-head`). At shutdown a head session can look like the most
+ * recently active session, so without this filter dsh-smart-restart would pin
+ * its post-restart notice to a head — making it run a spurious boot turn (which
+ * on the dev GUI froze mid-stream). A head must NEVER be selected as the
+ * "last active" session for the smart-shutdown auto-notification.
+ *
+ * A session is ignored when its id starts with ANY of the passed prefixes
+ * (defaults to the deepartments `head-` convention). The prefix set is
+ * configurable via `ignoredSessionPrefixes` so other patterns can be added.
+ */
+export function ignoredByPrefix(
+  sessionId: string | undefined,
+  prefixes: readonly string[],
+): boolean {
+  if (!sessionId || !prefixes || prefixes.length === 0) return false;
+  for (const prefix of prefixes) {
+    if (prefix && sessionId.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+/**
  * Decide which session the shutdown notice should be pinned to, if any.
  *
  * A notice present on boot means the process was stopped while at least one

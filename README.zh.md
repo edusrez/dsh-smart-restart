@@ -210,6 +210,7 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
 | `restartUnit` | string  | `''`              | 调用 `smart_restart` 时重启的 systemd 单元（例如 `dsh.service` 或 `dsh-deepartments-dev.service`）。必须按 profile 设置；为空 → 工具以清晰错误安全失败。 |
 | `toolEnabled` | boolean | `true`            | 是否注册 `smart_restart` 工具（是否对代理会话可用）。 |
 | `shutdownGraceMs` | number | `600000`          | 关闭前的时间窗口（毫秒，默认 10 分钟），其间最近一次代理活动计为“涉及代理”，用于智能关机自动通知。如果在关机时最近一次活动的会话空闲时间超过了该窗口，则跳过固定，投递回退到 `target`。 |
+| `ignoredSessionPrefixes` | string[] | `['head-']` | 永远不会被选为“最近活动”以用于智能关机自动通知的会话 id 前缀，因此 Deepartments 部门头部会话（`head-<postId>`）不会收到多余的重启后通知。可配置的列表；默认开启（跳过头部会话）。 |
 
 `target` 语义（仅回退路径 —— 待处理通知或可用的关机通知会覆盖当次启动的 `target`）：
 
@@ -232,6 +233,8 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
         restartUnit: dsh.service
         toolEnabled: true
         shutdownGraceMs: 600000
+        ignoredSessionPrefixes:
+          - head-
 ```
 
 > **单一投递通道。** 启用 `wakeup` 时通知通过 `agent.followup()` 投递；禁用时通过 `agent.inject()`。同一条消息**绝不会**同时走两者 —— 一条排队进入收件箱的 followup 与同一条消息的并行 inject 会与 Inbox 的“already pending”校验冲突。

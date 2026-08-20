@@ -36,6 +36,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
   buildNotice,
   detectRestart,
+  ignoredByPrefix,
   parsePendingNotice,
   parseShutdownNotice,
   selectsAgent,
@@ -57,6 +58,12 @@ export interface Config {
   /** Grace window (ms) before shutdown within which last agent activity counts
    *  as "agent-involved" for the smart shutdown auto-notification. */
   shutdownGraceMs: number
+  /** Session id prefixes that must NEVER be selected as "last active" for the
+   *  smart-shutdown auto-notification. Deepartments department heads are
+   *  first-class root agents with ids `head-<postId>`, and a head must never
+   *  receive a spurious post-restart notice, so `head-` is ignored by default.
+   *  Configure this to add/remove patterns. */
+  ignoredSessionPrefixes: string[]
 }
 
 const DEFAULTS: Config = {
@@ -68,6 +75,8 @@ const DEFAULTS: Config = {
   restartUnit: '',
   toolEnabled: true,
   shutdownGraceMs: 600_000, // 10 minutes
+  // Deepartments convention: heads are root agents with session id `head-<postId>`.
+  ignoredSessionPrefixes: ['head-'],
 }
 
 /** Fallback poll interval while waiting for a pinned session to resume. */
@@ -173,7 +182,10 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     try {
       const notice = parseShutdownNotice(readFileSync(shutdownPath, 'utf8'))
       const target = shutdownTarget(notice, Date.now(), config.shutdownGraceMs)
-      if (target) {
+      // Defense-in-depth: even if a stale (pre-0.3.1) shutdown-notice.json
+      // recorded a deepartments head as last-active, never pin a notice to an
+      // ignored session.
+      if (target && !ignoredByPrefix(target, config.ignoredSessionPrefixes)) {
         pinnedTarget = target
         pinnedReason = 'the process was stopped while this session was active'
         console.log('[smart-restart] pinned restart notice to last-active session', pinnedTarget)
@@ -209,6 +221,13 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   let lastActiveId: string | undefined
   let lastActiveAt = 0
   const recordActivity = (agent: Agent) => {
+    // NEVER select a deepartments head session as "last active": an ignored
+    // session's activity is treated as if it never happened, so the most recent
+    // NON-ignored session remains the recorded last-active (and if only heads
+    // were active, nothing is recorded at all). This prevents a head from ever
+    // receiving a spurious post-restart notice. Configurable via
+    // `ignoredSessionPrefixes` (default `['head-']`).
+    if (ignoredByPrefix(String(agent.id), config.ignoredSessionPrefixes)) return
     lastActiveId = String(agent.id)
     lastActiveAt = Date.now()
   }
@@ -373,7 +392,12 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   const shutdownDocPath = join(markerDir, 'shutdown-notice.json')
   const writeShutdownNotice = () => {
     try {
+      // Never write a shutdown notice for an ignored session (e.g. a
+      // deepartments `head-*` root agent). Safety net on top of the
+      // filter in recordActivity, so a head can never be persisted as
+      // last-active regardless of how the state was reached.
       if (!lastActiveId) return // nothing was active; do not write a notice
+      if (ignoredByPrefix(lastActiveId, config.ignoredSessionPrefixes)) return
       mkdirSync(markerDir, { recursive: true })
       const doc: ShutdownNotice = {
         lastSessionId: lastActiveId,

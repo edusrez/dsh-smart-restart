@@ -2,7 +2,7 @@
 // integration check against the compiled plugin (lib/index.js).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { detectRestart, parsePendingNotice, parseShutdownNotice, selectsAgent, shutdownTarget, targetsAgent } from '../lib/boot.js'
+import { detectRestart, ignoredByPrefix, parsePendingNotice, parseShutdownNotice, selectsAgent, shutdownTarget, targetsAgent } from '../lib/boot.js'
 
 const NOW = Date.parse('2026-08-18T12:00:00.000Z')
 const PREV = Date.parse('2026-08-18T11:59:00.000Z') // 60_000 ms before NOW
@@ -155,6 +155,45 @@ test('shutdownTarget: NaN guards return null', () => {
   assert.equal(shutdownTarget(notice, NaN, 600_000), null)
   // undefined shutdown time -> NaN
   assert.equal(shutdownTarget(notice, Number.NaN, 600_000), null)
+})
+
+// --- v0.3.1: ignored-session-prefix filter (deepartments heads) ------------
+
+// Deepartments heads are root agents with session id `head-<postId>`. They must
+// never be selected as the smart-shutdown "last active" session.
+test('ignoredByPrefix: deepartments head session is ignored by default head- prefix', () => {
+  assert.equal(ignoredByPrefix('head-research-head', ['head-']), true)
+  assert.equal(ignoredByPrefix('head-programming-head', ['head-']), true)
+  assert.equal(ignoredByPrefix('head-studio-head', ['head-']), true)
+})
+
+test('ignoredByPrefix: a head-* session is never selected as last active', () => {
+  // Any id starting with `head-` is ineligible for the last-active selection.
+  assert.equal(ignoredByPrefix('head-research-head', ['head-']), true)
+  assert.equal(ignoredByPrefix('head-research-head', ['head-', 'sys-']), true)
+})
+
+test('ignoredByPrefix: a normal session is NOT ignored', () => {
+  assert.equal(ignoredByPrefix('asistente', ['head-']), false)
+  assert.equal(ignoredByPrefix('primary', ['head-']), false)
+  assert.equal(ignoredByPrefix('session-abc', ['head-']), false)
+  // A session merely CONTAINING `head-` but not starting with it is fine.
+  assert.equal(ignoredByPrefix('the-head-office', ['head-']), false)
+})
+
+test('ignoredByPrefix: config overrides — custom prefixes replace the default', () => {
+  // With a custom prefix set, `head-` is no longer ignored unless listed.
+  assert.equal(ignoredByPrefix('head-research-head', ['bot-']), false)
+  assert.equal(ignoredByPrefix('bot-assistant', ['bot-']), true)
+  // Multiple custom prefixes all apply.
+  assert.equal(ignoredByPrefix('indexer-1', ['bot-', 'indexer-']), true)
+  assert.equal(ignoredByPrefix('asistente', ['bot-', 'indexer-']), false)
+})
+
+test('ignoredByPrefix: guards — undefined id and empty prefix set are not ignored', () => {
+  assert.equal(ignoredByPrefix(undefined, ['head-']), false)
+  assert.equal(ignoredByPrefix('head-x', []), false)
+  assert.equal(ignoredByPrefix('head-x', ['']), false)
 })
 
 // --- Small integration check against the compiled plugin -------------------

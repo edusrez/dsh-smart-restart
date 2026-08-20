@@ -211,6 +211,7 @@ All behavior is controlled through the plugin row's `config`:
 | `restartUnit` | string  | `''`              | Systemd unit to restart when `smart_restart` is invoked (e.g. `dsh.service` or `dsh-deepartments-dev.service`). Must be set per profile; empty → the tool fails safe with a clear error. |
 | `toolEnabled` | boolean | `true`            | Whether the `smart_restart` tool is registered (available to agent sessions). |
 | `shutdownGraceMs` | number | `600000`          | Grace window (ms, default 10 minutes) before shutdown within which last agent activity counts as "agent-involved" for the smart shutdown auto-notification. If the last-active session was idle beyond this window on shutdown, the pin is skipped and delivery falls back to `target`. |
+| `ignoredSessionPrefixes` | string[] | `['head-']` | Session-id prefixes that must never be selected as "last active" for the smart-shutdown auto-notification, so Deepartments department-head sessions (`head-<postId>`) don't get a spurious post-restart notice. Configurable list; default ON (heads skipped). |
 
 `target` semantics (fallback path only — a pending notice or a usable shutdown notice overrides `target` for that boot):
 
@@ -233,6 +234,8 @@ Full example patch row, restating every key with a custom notice and an explicit
         restartUnit: dsh.service
         toolEnabled: true
         shutdownGraceMs: 600000
+        ignoredSessionPrefixes:
+          - head-
 ```
 
 > **Single delivery channel.** When `wakeup` is enabled the notice is delivered via `agent.followup()`; when disabled, via `agent.inject()`. It is **never** both with the same message — a followup that queues into the inbox and a parallel inject of the same message would collide with Inbox's "already pending" validation.

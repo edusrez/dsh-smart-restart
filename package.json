@@ -1,6 +1,6 @@
 {
   "name": "dsh-smart-restart",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DSH host plugin that detects when the DeepSeek Harness service has restarted and wakes the main agent at boot with a notice, so interrupted work can be resumed.",
   "keywords": [
     "dsh",

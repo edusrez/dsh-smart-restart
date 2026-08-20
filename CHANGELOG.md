@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-08-20
+
+### Fixed
+
+- The smart-shutdown "last active session" selection can no longer pick a **Deepartments department head** session. Heads are now first-class root agents with durable session ids `head-<postId>` (e.g. `head-research-head`), and at shutdown a head could look like the most recently active session, so the plugin would pin a spurious post-restart notice to it — making the head run a boot turn that froze mid-stream on the dev GUI (reported 2026-08-20). Head sessions are now filtered out of last-active tracking, the shutdown-notice write, and the boot-side pin consumption.
+
+### Added
+
+- **`ignoredSessionPrefixes` config** (default `['head-']`): session-id prefixes that must never be selected as "last active" for the smart-shutdown auto-notification. Defaults to the Deepartments `head-` convention; add other prefixes to ignore more patterns. Excludes only the smart-shutdown auto-notification path — the explicit `smart_restart` tool target (the caller) and genuine user/main-agent sessions are untouched.
+
 ## [0.3.0] - 2026-08-18
 
 ### Fixed
