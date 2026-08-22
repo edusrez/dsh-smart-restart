@@ -52,18 +52,38 @@ test('deriveExecStartParams: null when there is no executable', () => {
 test('buildPatchContent: disables smart-restart and applies a relative override under tmpDir', () => {
   const content = buildPatchContent('/tmp/dsh-canary-x1', { deepartments: '' })
   assert.ok(content.includes('- id: smart-restart\n  config:\n    enabled: false'))
-  assert.ok(content.includes('- id: deepartments\n  config:\n    stateDir: /tmp/dsh-canary-x1/deepartments'))
+  assert.ok(content.includes('- id: deepartments\n  config:\n    stateDir: "/tmp/dsh-canary-x1/deepartments"'))
 })
 
 test('buildPatchContent: override for smart-restart itself merges stateDir into its own row', () => {
   const content = buildPatchContent('/tmp/dsh-canary-x2', { 'smart-restart': '' })
-  assert.ok(content.includes('- id: smart-restart\n  config:\n    enabled: false\n    stateDir: /tmp/dsh-canary-x2/smart-restart'))
+  assert.ok(content.includes('- id: smart-restart\n  config:\n    enabled: false\n    stateDir: "/tmp/dsh-canary-x2/smart-restart"'))
+})
+
+test('buildPatchContent: mixed overrides emit one complete smart-restart row (enabled:false + stateDir) before the other rows', () => {
+  const content = buildPatchContent('/tmp/dsh-canary-mix', { deepartments: '', 'smart-restart': '' })
+  // Exactly one self-contained smart-restart block: disabled AND redirected,
+  // with the merged stateDir INSIDE it (never leaked into another row).
+  const srBlock = '- id: smart-restart\n  config:\n    enabled: false\n    stateDir: "/tmp/dsh-canary-mix/smart-restart"'
+  assert.ok(content.includes(srBlock), `expected complete smart-restart block in:\n${content}`)
+  assert.equal(content.split('- id: smart-restart').length - 1, 1, 'smart-restart row appears exactly once')
+  // The other row keeps its own complete block (trailing newline: nothing
+  // leaked into it).
+  const deBlock = '- id: deepartments\n  config:\n    stateDir: "/tmp/dsh-canary-mix/deepartments"\n'
+  assert.ok(content.includes(deBlock), `expected complete deepartments block in:\n${content}`)
+  // The smart-restart block precedes the other row.
+  assert.ok(content.indexOf(srBlock) < content.indexOf(deBlock), 'smart-restart row emitted before other rows')
 })
 
 test('buildPatchContent: absolute override paths are used verbatim, relative ones resolve under tmpDir', () => {
   const content = buildPatchContent('/tmp/dsh-canary-x3', { deepartments: '/tmp/abs-state', other: 'rel/dir' })
-  assert.ok(content.includes('- id: deepartments\n  config:\n    stateDir: /tmp/abs-state'))
-  assert.ok(content.includes('- id: other\n  config:\n    stateDir: /tmp/dsh-canary-x3/rel/dir'))
+  assert.ok(content.includes('- id: deepartments\n  config:\n    stateDir: "/tmp/abs-state"'))
+  assert.ok(content.includes('- id: other\n  config:\n    stateDir: "/tmp/dsh-canary-x3/rel/dir"'))
+})
+
+test('buildPatchContent: stateDir paths containing spaces render quoted (YAML-safe)', () => {
+  const content = buildPatchContent('/tmp/dsh canary x', { deepartments: '' })
+  assert.ok(content.includes('- id: deepartments\n  config:\n    stateDir: "/tmp/dsh canary x/deepartments"'))
 })
 
 test('buildPatchContent: emitted document is a well-formed top-level row list', () => {

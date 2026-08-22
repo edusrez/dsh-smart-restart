@@ -555,14 +555,18 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
             },
           },
           render: (_args, value) => {
-            const lines: { type: 'text'; text: string }[] = [
-              {
+            const lines: { type: 'text'; text: string }[] = []
+            // A failed canary already aborts the restart; render ONLY the
+            // canary line so the abort reason is not duplicated by the generic
+            // error line below.
+            if (value.canary !== 'failed') {
+              lines.push({
                 type: 'text',
                 text: value.error
                   ? `smart_restart failed: ${value.error}`
                   : `Restarting the DSH service (session ${value.sessionId ?? '?'}) in ~1s; the notice will return to this session after it is back up.`,
-              },
-            ]
+              })
+            }
             if (value.canary) {
               lines.push({
                 type: 'text',

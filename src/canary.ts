@@ -133,14 +133,23 @@ export function resolveExecTarget(
  *
  * Always emits a row disabling THIS plugin in the ephemeral canary
  * (`config.enabled: false` — apply() returns immediately, so the canary never
- * writes a marker or notice into the live state dir). Then emits one row per
- * `canaryStateDirOverrides` entry, replacing that row's stateDir with its
- * temp path: an absolute value is used verbatim, a relative or empty value
- * resolves under `tmpDir` (e.g. `deepartments: ''` → `stateDir:
- * <tmpDir>/deepartments`), so the canary never writes live board state from
- * other plugins either.
+ * writes a marker or notice into the live state dir), emitted FIRST as one
+ * complete block; when `canaryStateDirOverrides` lists `smart-restart`, that
+ * same block also carries the redirected `stateDir` (the merge lives INSIDE
+ * the row, so it can never leak into another row's config). Then emits one
+ * row per remaining `canaryStateDirOverrides` entry, replacing that row's
+ * stateDir with its temp path: an absolute value is used verbatim, a relative
+ * or empty value resolves under `tmpDir` (e.g. `deepartments: ''` →
+ * `stateDir: "<tmpDir>/deepartments"`), so the canary never writes live board
+ * state from other plugins either.
  */
 export function buildPatchContent(tmpDir: string, overrides: Record<string, string> = {}): string {
+  // The smart-restart row is emitted FIRST as one complete self-contained
+  // block: always `enabled: false` (the canary must never write a marker or
+  // notice into the live state dir), plus its own optional redirected stateDir
+  // when the caller lists `smart-restart` in canaryStateDirOverrides. The
+  // merged stateDir is part of THIS block, so it can never land inside another
+  // row's config even when other override rows follow.
   const lines = [
     "# dsh-smart-restart canary overlay (generated at runtime).",
     "# Applied via `dsh --patch` AFTER the profile layer for --dump-config and",
@@ -152,16 +161,16 @@ export function buildPatchContent(tmpDir: string, overrides: Record<string, stri
     '  config:',
     '    enabled: false',
   ]
+  if ('smart-restart' in overrides) {
+    // Quote the path (YAML-safe for spaces, e.g. /tmp paths with spaces).
+    lines.push(`    stateDir: "${resolveOverrideDir(overrides['smart-restart'], 'smart-restart', tmpDir)}"`)
+  }
   for (const [key, dir] of Object.entries(overrides)) {
-    const resolved = resolveOverrideDir(dir, key, tmpDir)
-    if (key === 'smart-restart') {
-      // Merge into this plugin's own row: keep it disabled AND redirect state.
-      lines.push(`    stateDir: ${resolved}`)
-      continue
-    }
+    if (key === 'smart-restart') continue
     lines.push(`- id: ${key}`)
     lines.push('  config:')
-    lines.push(`    stateDir: ${resolved}`)
+    // Quote the path (YAML-safe for spaces, e.g. /tmp paths with spaces).
+    lines.push(`    stateDir: "${resolveOverrideDir(dir, key, tmpDir)}"`)
   }
   return `${lines.join('\n')}\n`
 }
