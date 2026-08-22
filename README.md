@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of service restarts — **without the user having to prompt it**. On every boot it detects that a new process has taken over, wakes the target agent with a short "Smart-restart" notice (boot time, previous boot, downtime). New in **v0.2.0** it added the `smart_restart` tool to **restart DSH itself** and return the notice to the exact session that asked; new in **v0.3.0** it **auto-detects** when the service was stopped while an agent session was active, so even a *plain* `systemctl restart` the agent ran notifies that session at boot.
+A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of service restarts — **without the user having to prompt it**. On every boot it detects that a new process has taken over, wakes the target agent with a short "Smart-restart" notice (boot time, previous boot, downtime). New in **v0.2.0** it added the `smart_restart` tool to **restart DSH itself** and return the notice to the exact session that asked; new in **v0.3.0** it **auto-detects** when the service was stopped while an agent session was active, so even a *plain* `systemctl restart` the agent ran notifies that session at boot; new in **v0.4.0** it can **validate the launch first** with an optional canary pre-restart gate that aborts the restart when an ephemeral boot fails.
 
 [![npm](https://img.shields.io/npm/v/dsh-smart-restart?style=flat-square&logo=npm)](https://www.npmjs.com/package/dsh-smart-restart)
 [![license](https://img.shields.io/npm/l/dsh-smart-restart?style=flat-square)](LICENSE)
@@ -14,6 +14,7 @@ A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of serv
 - [Overview](#overview)
 - [How it works](#how-it-works)
 - [The `smart_restart` tool](#the-smart_restart-tool)
+- [Canary pre-restart validation](#canary-pre-restart-validation)
 - [Requirements](#requirements)
 - [Install](#install)
 - [Configuration](#configuration)
@@ -35,6 +36,7 @@ A long-lived DSH instance restarts for many reasons: the agent installs or recon
 - **Automatic wake** — an idle main agent is woken and handed the notice on its own.
 - **Targeted delivery** — the post-restart notice returns to the session that requested it; otherwise the `target` config decides where it lands.
 - **Precise context** — the notice carries the boot time, the previous boot time, the downtime, and an optional reason.
+- **Canary safety** — an optional pre-restart gate boots an ephemeral DSH instance and aborts the restart when it fails (see below).
 - **Self-contained** — a single host bundle; nothing to run, no external service.
 
 ## How it works
@@ -101,6 +103,7 @@ Registered via `ctx.tools.register` in `apply` (so it is available to agent sess
 | Param    | Type   | Required | Description |
 | -------- | ------ | -------- | ----------- |
 | `reason` | string | no       | Optional human-readable note, e.g. `"installed dshmarket in stable+dev"`. Included in the post-restart notice. |
+| `canary` | boolean | no      | Optional canary pre-restart validation for THIS call: boots an ephemeral DSH instance and aborts the restart on failure (see [Canary pre-restart validation](#canary-pre-restart-validation)). Overrides the configured `canary` for this call. |
 
 **Behavior**
 
@@ -124,6 +127,52 @@ install/change a plugin
 
 - The unit token is validated against a strict regex to block shell injection through `restartUnit` into the detached shell command.
 - The tool targets a **systemd-managed** DSH install (`setsid` / `systemctl`); it does not apply to a bare process without a systemd unit.
+
+## Canary pre-restart validation
+
+> **New in v0.4.0.** Optional, opt-in, and fully generic — it works on any DSH
+> install: `restartUnit` remains the only required tool config.
+
+When enabled, the `smart_restart` tool can validate the launch **before** anything is persisted or restarted: it boots an **ephemeral DSH instance** from the same binary and profile as the systemd unit, verifies it starts, and only then proceeds with the real `systemctl restart`. A failed canary **aborts the restart** — no pending notice is written, nothing is spawned, and the calling session is alerted live (same plugin-source notice channel).
+
+**What it does, step by step**
+
+1. **Resolves the dsh binary/profile** — an explicit `canaryBinary` / `canaryProfile` wins; otherwise both are derived from `systemctl show -p ExecStart <restartUnit>` (binary falls back to `dsh` on PATH). The `--profile` flag is omitted when no profile resolves.
+2. **Creates a temp state dir and a temp patch overlay** (`dsh --patch <tmp>/canary.patch.yml`, applied after the profile layer): the `smart-restart` row itself is disabled in the canary (`enabled: false`) and every `canaryStateDirOverrides` entry gets its `stateDir` redirected into the temp dir — so the canary never writes a marker, notice, or live board state.
+3. **Pre-flights the launch** with `--dump-config` (20s timeout; a compose failure aborts the restart).
+4. **Boots the ephemeral instance** detached with the same overlay on an auto-picked free port (`canaryPort` when set) and **polls** `http://127.0.0.1:<port>/` until HTTP 200 or `canaryTimeoutMs` elapses (per-attempt 800ms; a refused connection or non-200 is "not yet").
+5. **Stops the ephemeral** (process-group kill) and returns: `passed` → the restart proceeds; `failed` → abort + alert the caller; `skipped` → the restart proceeds (a skip is not a failure).
+
+**When it skips (never blocks)** — if the dsh binary/profile cannot be derived (no `systemctl` lookup result AND no explicit `canaryBinary`/`canaryProfile`), the canary reports `skipped` and the restart proceeds unchanged. Generic installs are therefore always safe: a canary failure only ever aborts a restart when *you* opted in with an actual, resolvable launch target.
+
+**How to enable**
+
+- **Per profile**: add `canary: true` (plus any overrides) to the `smart-restart` row. The per-profile patch row REPLACES the row's whole config, so restate your existing fields (see the example in [Configuration](#configuration)).
+- **Per call** (agent-facing): call `smart_restart(canary: true, reason)`, which overrides the configured default for that single call.
+
+**Config fields**
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `canary` | boolean | `false` | Master opt-in for the canary gate. |
+| `canaryTimeoutMs` | number | `45000` | Hard window (ms) for the canary boot liveness probe; a timeout is a canary failure and aborts the restart. |
+| `canaryPort` | number | `0` | HTTP port for the ephemeral canary instance; `0` auto-picks a free port. |
+| `canaryProfile` | string | `''` | Explicit dsh profile for the canary launch; empty derives from the unit's `ExecStart` (`--profile`). |
+| `canaryBinary` | string | `''` | Explicit dsh binary for the canary launch; empty derives from the unit's `ExecStart`, else `dsh` on PATH. |
+| `canaryStateDirOverrides` | object | `{}` | Plugin-row id → temp dir: those rows get their `stateDir` redirected in the canary patch (e.g. `deepartments: ''` keeps the canary off live board state). Relative or empty values resolve under the canary temp dir; absolute values are used verbatim. |
+
+> **Note on overrides and row replacement.** Patch rows replace their row's
+> WHOLE config (no merge) — and the canary is a throwaway instance, so a
+> listed row gets only its `stateDir` overridden and its remaining config
+> reverts to that plugin's own defaults. Use `canaryStateDirOverrides` only
+> for rows that boot fine with defaulted config (the live profile's row is
+> untouched). Rows that don't exist in the canary's composed tree are skipped
+> with a loader warning.
+
+**Output** — when a canary ran, the tool result carries `canary` (`passed` /
+`skipped` / `failed`) plus `canaryDetail`, and the rendered response gains a
+`Canary: …` line (`Canary: passed — restarting…`, `Canary: failed — restart
+ABORTED: <detail>`, or `Canary: skipped — <detail>`).
 
 ## Requirements
 
@@ -212,6 +261,12 @@ All behavior is controlled through the plugin row's `config`:
 | `toolEnabled` | boolean | `true`            | Whether the `smart_restart` tool is registered (available to agent sessions). |
 | `shutdownGraceMs` | number | `600000`          | Grace window (ms, default 10 minutes) before shutdown within which last agent activity counts as "agent-involved" for the smart shutdown auto-notification. If the last-active session was idle beyond this window on shutdown, the pin is skipped and delivery falls back to `target`. |
 | `ignoredSessionPrefixes` | string[] | `['head-']` | Session-id prefixes that must never be selected as "last active" for the smart-shutdown auto-notification, so Deepartments department-head sessions (`head-<postId>`) don't get a spurious post-restart notice. Configurable list; default ON (heads skipped). |
+| `canary` | boolean | `false` | Opt-in [canary pre-restart validation](#canary-pre-restart-validation): boot an ephemeral DSH instance and abort the restart on failure. The per-call `canary` tool parameter overrides this for one call. |
+| `canaryTimeoutMs` | number | `45000` | Hard window (ms) for the canary boot liveness probe (default 45s); a timeout is a canary failure and aborts the restart. |
+| `canaryPort` | number | `0` | HTTP port for the ephemeral canary instance; `0` auto-picks a free port. |
+| `canaryProfile` | string | `''` | Explicit dsh profile for the canary launch; empty derives it from the unit's `ExecStart` (`--profile`). |
+| `canaryBinary` | string | `''` | Explicit dsh binary for the canary launch; empty derives it from the unit's `ExecStart`, else `dsh` on PATH. |
+| `canaryStateDirOverrides` | object | `{}` | Plugin-row id → temp dir; those rows get their `stateDir` redirected in the canary patch so the ephemeral never writes live state (e.g. `deepartments: ''` keeps the canary off live board state). Relative or empty values resolve under the canary temp dir; absolute values are used verbatim. |
 
 `target` semantics (fallback path only — a pending notice or a usable shutdown notice overrides `target` for that boot):
 
@@ -236,6 +291,13 @@ Full example patch row, restating every key with a custom notice and an explicit
         shutdownGraceMs: 600000
         ignoredSessionPrefixes:
           - head-
+        canary: true
+        canaryTimeoutMs: 45000
+        canaryPort: 0
+        canaryProfile: ''
+        canaryBinary: ''
+        canaryStateDirOverrides:
+          deepartments: ''
 ```
 
 > **Single delivery channel.** When `wakeup` is enabled the notice is delivered via `agent.followup()`; when disabled, via `agent.inject()`. It is **never** both with the same message — a followup that queues into the inbox and a parallel inject of the same message would collide with Inbox's "already pending" validation.
@@ -256,6 +318,7 @@ Be honest about what this plugin does not do:
 - **Not for the one-shot headless CLI.** A boot-time wake may not exit cleanly in a single-shot headless run; this plugin targets long-lived GUI instances. The notice is still delivered and committed, but for headless one-shots it is of little use.
 - **Per-DSH-home marker.** The marker lives under a single `<DSH_HOME>`, so separate homes (e.g. your stable vs. dev instance) are tracked independently — a restart of one does not notify agents in the other.
 - **Tool requires restartUnit.** The `smart_restart` tool needs a configured `restartUnit`; without it the tool fails safe. Non-tool restarts are still auto-detected when an agent was active within `shutdownGraceMs`, otherwise they fall back to `target`.
+- **Canary adds latency.** A canary-gated call blocks the tool for up to `canaryTimeoutMs` (default 45s) while the ephemeral instance boots and is probed; disable the canary (or lower the timeout) for fast, low-risk restarts. The canary validates config/compose + boot health, not the `systemctl restart` command itself (the restart remains fire-and-forget).
 - **Existing sessions may lack the tool.** A session whose toolset was created **before** the plugin was installed won't have `smart_restart` — start a new chat after installing to pick it up.
 - **rc-era API.** The plugin targets DSH `>= 0.1.0-rc.7`; pre-1.0 APIs (events, session ids, message forms) may change in later releases.
 
@@ -263,11 +326,13 @@ Be honest about what this plugin does not do:
 
 ```
 src/
-  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool, delivery (followup/inject)
+  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool (incl. the optional canary gate + abort alert), delivery (followup/inject)
   boot.ts    — pure, deterministic restart + notice logic (I/O-free, unit-testable), incl. parseShutdownNotice / shutdownTarget
+  canary.ts  — optional canary pre-restart validation: ExecStart derivation, temp patch build, free-port pick, dump-config pre-flight, boot + liveness probe (all IO injectable via CanaryHooks)
 test/
   marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / selectsAgent / targetsAgent / compiled exports
   notice.test.js  — buildNotice / humanizeDowntime
+  canary.test.js  — deriveExecStartParams / buildPatchContent / pickFreePort / probeStatusHealthy / resolveExecTarget / runCanary with injected hooks
 ```
 
 - `pnpm install` — install dependencies.

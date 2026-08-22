@@ -46,6 +46,25 @@ import {
   type SmartRestartParams,
   type SmartRestartResult,
 } from './boot.js'
+import { runCanary, type CanaryResult } from './canary.js'
+
+/**
+ * smart_restart call extended with the optional per-call canary gate.
+ * The canary fields live here (not in boot.ts) because they are tool-only;
+ * boot.ts stays the pure, IO-free module.
+ */
+export interface SmartRestartCall extends SmartRestartParams {
+  /** Run the canary pre-restart validation for THIS call; overrides config.canary. */
+  canary?: boolean
+}
+
+/** smart_restart result extended with the canary outcome. */
+export interface SmartRestartOutcome extends SmartRestartResult {
+  /** Canary gate outcome: 'skipped' | 'passed' | 'failed' (absent when no canary ran). */
+  canary?: 'skipped' | 'passed' | 'failed'
+  /** Human detail for a skipped/failed canary outcome. */
+  canaryDetail?: string
+}
 
 export interface Config {
   enabled: boolean
@@ -64,6 +83,26 @@ export interface Config {
    *  receive a spurious post-restart notice, so `head-` is ignored by default.
    *  Configure this to add/remove patterns. */
   ignoredSessionPrefixes: string[]
+  /** Opt-in canary pre-restart validation: boot an ephemeral DSH instance and
+   *  abort the restart when it fails (see src/canary.ts). The per-call
+   *  `canary` tool parameter overrides this for one call. */
+  canary: boolean
+  /** Hard cap (ms) for the canary boot liveness probe (default 45s); a timeout
+   *  is a canary failure and aborts the restart. */
+  canaryTimeoutMs: number
+  /** HTTP port for the ephemeral canary instance; 0 = auto-pick a free port. */
+  canaryPort: number
+  /** Explicit dsh profile for the canary launch; '' = derive from the unit's
+   *  ExecStart (`--profile`). */
+  canaryProfile: string
+  /** Explicit dsh binary for the canary launch; '' = derive from the unit's
+   *  ExecStart, else `dsh` on PATH. */
+  canaryBinary: string
+  /** Plugin-row id → temp dir: those rows get their stateDir redirected in
+   *  the canary patch, so the ephemeral never writes live board/marker state.
+   *  Relative or empty values resolve under the canary temp dir; absolute
+   *  values are used verbatim. */
+  canaryStateDirOverrides: Record<string, string>
 }
 
 const DEFAULTS: Config = {
@@ -77,6 +116,13 @@ const DEFAULTS: Config = {
   shutdownGraceMs: 600_000, // 10 minutes
   // Deepartments convention: heads are root agents with session id `head-<postId>`.
   ignoredSessionPrefixes: ['head-'],
+  // Optional canary gate: off by default; opt in per profile and/or per call.
+  canary: false,
+  canaryTimeoutMs: 45_000,
+  canaryPort: 0,
+  canaryProfile: '',
+  canaryBinary: '',
+  canaryStateDirOverrides: {},
 }
 
 /** Fallback poll interval while waiting for a pinned session to resume. */
@@ -282,6 +328,50 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     return true
   }
 
+  // --- 3c. Canary abort alert (live-session delivery, no restart follows). --
+  // Reuses the notice message shape (createUserMessage + plugin source
+  // {kind:'plugin', plugin:'dsh-smart-restart', form:'notice'}) and the same
+  // single-channel wakeup/inject selection as deliver(), but addressed to the
+  // LIVE calling session via ctx (unlike deliver(), this is not boot-driven
+  // and never uses pending-notice.json — no restart follows a failed canary).
+  const alertCaller = (sessionId: string, text: string): void => {
+    try {
+      const msg: UserMessage = createUserMessage({
+        content: [{ type: 'text', text }],
+        source: {
+          kind: 'plugin',
+          plugin: 'dsh-smart-restart',
+          form: 'notice',
+          summary: 'Smart-restart: canary validation failed — restart aborted',
+        },
+      })
+      const agent = ctx.agents.get(SessionId(sessionId))
+      if (!agent) {
+        console.warn('[smart-restart] canary abort alert: calling session not found:', sessionId)
+        return
+      }
+      if (config.wakeup !== false) {
+        // Wake the idle agent AND deliver in one call (never inject alongside).
+        try {
+          agent.followup(msg)
+          console.log('[smart-restart] canary abort alert delivered to', sessionId)
+        } catch (err) {
+          console.warn('[smart-restart] canary abort alert followup failed:', err)
+        }
+      } else {
+        // No wake: queue model-facing context only.
+        try {
+          agent.inject(msg)
+          console.log('[smart-restart] canary abort alert delivered to', sessionId)
+        } catch (err) {
+          console.warn('[smart-restart] canary abort alert inject failed:', err)
+        }
+      }
+    } catch (err) {
+      console.warn('[smart-restart] canary abort alert failed:', err)
+    }
+  }
+
   const agentIsRoot = (agent: Agent): boolean =>
     ctx.agents.roots().some((r) => r.id === agent.id)
 
@@ -444,6 +534,11 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
             description:
               'Optional human-readable note, e.g. "installed dshmarket in stable+dev". Included in the post-restart notice.',
           },
+          canary: {
+            type: 'boolean',
+            description:
+              'Optional: validate the restart with a canary pre-flight first — boots an ephemeral DSH instance (same binary/profile as this unit) on a temp free port with a temp state overlay, probes HTTP health, and aborts the restart on failure. Overrides the configured `canary` for this call.',
+          },
         },
         output: {
           schema: {
@@ -455,19 +550,62 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
               sessionId: { type: 'string' },
               reason: { type: 'string' },
               error: { type: 'string' },
+              canary: { type: 'string' },
+              canaryDetail: { type: 'string' },
             },
           },
-          render: (_args, value) => [
-            {
-              type: 'text',
-              text:
-                value.error
+          render: (_args, value) => {
+            const lines: { type: 'text'; text: string }[] = [
+              {
+                type: 'text',
+                text: value.error
                   ? `smart_restart failed: ${value.error}`
                   : `Restarting the DSH service (session ${value.sessionId ?? '?'}) in ~1s; the notice will return to this session after it is back up.`,
-            } as const,
-          ],
+              },
+            ]
+            if (value.canary) {
+              lines.push({
+                type: 'text',
+                text:
+                  value.canary === 'passed'
+                    ? 'Canary: passed — restarting…'
+                    : value.canary === 'failed'
+                      ? `Canary: failed — restart ABORTED: ${value.canaryDetail ?? ''}`
+                      : `Canary: skipped — ${value.canaryDetail ?? ''}`,
+              })
+            }
+            return lines
+          },
         },
-        async execute(args, exec): Promise<SmartRestartResult> {
+        async execute(args, exec): Promise<SmartRestartOutcome> {
+          const guard = guardRestart(config, exec)
+          if (!guard.ok) return guard.result
+          // --- Optional canary gate (runs after the guards, BEFORE the
+          //      pending-notice persist and BEFORE any spawn). ---------------
+          // A failed canary aborts the restart: no pending notice is written,
+          // nothing is spawned, and the calling session is alerted live.
+          if (args.canary ?? config.canary) {
+            let canary: CanaryResult
+            try {
+              canary = await runCanary(ctx, config, args as SmartRestartCall)
+            } catch (err) {
+              canary = { status: 'failed', detail: `canary error: ${String(err)}` }
+            }
+            if (canary.status === 'failed') {
+              console.warn('[smart-restart] smart_restart: canary failed; restart aborted:', canary.detail)
+              alertCaller(guard.sessionId, `smart_restart canary FAILED — restart aborted: ${canary.detail}`)
+              return {
+                ok: false,
+                restarting: false,
+                canary: 'failed',
+                canaryDetail: canary.detail,
+                error: 'canary failed; restart aborted',
+              }
+            }
+            // passed / skipped → proceed with the normal restart and carry the
+            // canary outcome onto the result.
+            return performRestart(args, exec, markerDir, config, { status: canary.status, detail: canary.detail })
+          }
           return performRestart(args, exec, markerDir, config)
         },
       }),
@@ -484,29 +622,50 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   })
 }
 
+/**
+ * Validate a restart request before anything is persisted or spawned.
+ *
+ * Shared by the tool execute flow (which additionally runs the optional canary
+ * gate BETWEEN the guards and the pending-notice persist) and by
+ * performRestart itself (defense in depth). Returns the resolved unit + calling
+ * session id, or a fail-fast tool result to return as-is.
+ */
+function guardRestart(
+  config: Config,
+  exec: { agent?: { id: unknown } },
+):
+  | { ok: true; unit: string; sessionId: string }
+  | { ok: false; result: SmartRestartOutcome } {
+  if (!config.restartUnit) {
+    console.warn('[smart-restart] smart_restart: restartUnit not configured')
+    return { ok: false, result: { ok: false, restarting: false, error: 'restartUnit not configured' } }
+  }
+  // Fail safe: accept a single systemd unit token (no spaces/slashes) to
+  // avoid shell injection through restartUnit into the detached command.
+  const unit = config.restartUnit.split(' ')[0]
+  if (!UNIT_TOKEN_RE.test(unit)) {
+    console.warn('[smart-restart] smart_restart: invalid restartUnit token:', unit)
+    return { ok: false, result: { ok: false, restarting: false, error: `invalid restartUnit: ${unit}` } }
+  }
+  const sessionId = String(exec.agent?.id ?? '')
+  if (!sessionId) {
+    return { ok: false, result: { ok: false, restarting: false, error: 'no calling session' } }
+  }
+  return { ok: true, unit, sessionId }
+}
+
 /** Restart the DSH systemd unit and pin the notice to the calling session. */
 function performRestart(
-  args: SmartRestartParams,
+  args: SmartRestartCall,
   exec: { agent?: { id: unknown } },
   markerDir: string,
   config: Config,
-): SmartRestartResult {
+  canary?: { status: 'passed' | 'skipped'; detail: string },
+): SmartRestartOutcome {
   try {
-    if (!config.restartUnit) {
-      console.warn('[smart-restart] smart_restart: restartUnit not configured')
-      return { ok: false, restarting: false, error: 'restartUnit not configured' }
-    }
-    // Fail safe: accept a single systemd unit token (no spaces/slashes) to
-    // avoid shell injection through restartUnit into the detached command.
-    const unit = config.restartUnit.split(' ')[0]
-    if (!UNIT_TOKEN_RE.test(unit)) {
-      console.warn('[smart-restart] smart_restart: invalid restartUnit token:', unit)
-      return { ok: false, restarting: false, error: `invalid restartUnit: ${unit}` }
-    }
-    const sessionId = String(exec.agent?.id ?? '')
-    if (!sessionId) {
-      return { ok: false, restarting: false, error: 'no calling session' }
-    }
+    const guard = guardRestart(config, exec)
+    if (!guard.ok) return guard.result
+    const { unit, sessionId } = guard
 
     // Persist the pending notice FIRST (synchronously, before any spawn) so it
     // survives the imminent service kill and targets the restarting session.
@@ -527,7 +686,13 @@ function performRestart(
     )
     child.unref()
 
-    return { ok: true, restarting: true, sessionId, reason: pending.reason }
+    const result: SmartRestartOutcome = { ok: true, restarting: true, sessionId, reason: pending.reason }
+    if (canary) {
+      result.canary = canary.status
+      // A skip carries its human detail; a pass is self-explanatory.
+      if (canary.status === 'skipped') result.canaryDetail = canary.detail
+    }
+    return result
   } catch (err) {
     console.warn('[smart-restart] smart_restart failed:', err)
     return { ok: false, restarting: false, error: String(err) }

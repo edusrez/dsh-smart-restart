@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-22
+
+### Added
+
+- **Canary pre-restart validation** (opt-in per profile and/or per call, fully generic). Before restarting, the `smart_restart` tool can boot an **ephemeral DSH instance** from the same binary/profile as the systemd unit — an auto-picked free port, a temp state dir, and a temp `dsh --patch` overlay (applied after the profile) that disables this plugin in the canary (`enabled: false`) and redirects listed rows' `stateDir` into the temp dir. The launch is first validated with `--dump-config`, then the boot is probed over HTTP until healthy or the timeout, and the ephemeral is always stopped (process-group kill) before returning. A canary **failure aborts the restart** — no pending notice is persisted, nothing is spawned, and the calling session is alerted live through the same plugin-source notice channel (followup/inject). A canary **skip is not a failure** and never blocks a restart. It is **skipped** (never blocks) when the dsh binary/profile cannot be derived (no `systemctl` lookup result AND no explicit binary/profile), so generic installs stay safe.
+- **`canary` config** (default `false`): master opt-in for the canary gate; the per-call `canary` tool parameter overrides it for a single call.
+- **`canaryTimeoutMs` config** (default `45000`): hard window for the canary boot liveness probe; a timeout is a canary failure and aborts the restart.
+- **`canaryPort` config** (default `0`): fixed HTTP port for the ephemeral canary instance; `0` auto-picks a free port.
+- **`canaryProfile` / `canaryBinary` config** (default `''`): explicit dsh profile/binary for the canary launch; empty derives them from `systemctl show -p ExecStart <restartUnit>` (binary falls back to `dsh` on PATH).
+- **`canaryStateDirOverrides` config** (default `{}`): plugin-row id → temp dir map; those rows get their `stateDir` redirected in the canary patch (e.g. `deepartments: ''` keeps the canary off live board state). Relative or empty values resolve under the canary temp dir; absolute values are used verbatim.
+- Pure-logic unit tests for `deriveExecStartParams`, `buildPatchContent`, the free-port picker, the liveness status mapping, and the `runCanary` skipped/failed/passed paths with injected hooks — no dsh service, `/opt/dsh`, or systemctl needed.
+
+### Changed
+
+- The `smart_restart` tool output is extended (backward compatible): two optional result fields `canary` (`skipped` | `passed` | `failed`) and `canaryDetail`, plus an optional `canary` input parameter; the rendered response gains a `Canary: …` line when a canary ran (`Canary: passed — restarting…`, `Canary: failed — restart ABORTED: <detail>`, `Canary: skipped — <detail>`).
+- The canary gate runs **after** the existing `restartUnit`/session guards and **before** the pending-notice persist and the restart spawn — a failed canary leaves no pending notice behind; `restartUnit` remains the only required tool config.
+
 ## [0.3.1] - 2026-08-20
 
 ### Fixed

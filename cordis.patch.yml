@@ -18,3 +18,22 @@
         # agent activity counts as "agent-involved" for the smart shutdown
         # auto-notification (boot pins to that session instead of `target`).
         shutdownGraceMs: 600000
+        # optional canary pre-restart validation (default false): boots an
+        # ephemeral DSH instance (same binary/profile as this unit) on a temp
+        # free port with a temp state overlay, probes HTTP health, and aborts
+        # the restart on failure. The per-call `canary` tool param overrides.
+        canary: false
+        # hard window (ms) for the canary boot liveness probe (default 45s);
+        # a timeout is a canary failure and aborts the restart.
+        canaryTimeoutMs: 45000
+        # HTTP port for the canary instance (default 0 = auto-pick a free port).
+        canaryPort: 0
+        # explicit dsh profile/binary for the canary launch (default '' =
+        # derive from `systemctl show -p ExecStart` of restartUnit; the binary
+        # falls back to `dsh` on PATH).
+        canaryProfile: ''
+        canaryBinary: ''
+        # plugin-row id -> temp dir: those rows get their stateDir redirected
+        # in the canary patch so the ephemeral never writes live state
+        # (e.g. `deepartments: ''` keeps the canary off live board state).
+        canaryStateDirOverrides: {}
