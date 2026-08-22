@@ -1,6 +1,9 @@
 # dsh-smart-restart
 
 English | [中文](README.zh.md)
+![dsh-smart-restart demo — real-time restart](assets/demo.gif)
+
+*A real-time restart: the agent restarts the service (canary pre-flight passing, `Canary: passed — restarting…`), and the plugin's boot notification brings the very same session right back — the conversation continues automatically, no user prompt needed.*
 
 A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of service restarts — **without the user having to prompt it**. On every boot it detects that a new process has taken over, wakes the target agent with a short "Smart-restart" notice (boot time, previous boot, downtime). New in **v0.2.0** it added the `smart_restart` tool to **restart DSH itself** and return the notice to the exact session that asked; new in **v0.3.0** it **auto-detects** when the service was stopped while an agent session was active, so even a *plain* `systemctl restart` the agent ran notifies that session at boot; new in **v0.4.0** it can **validate the launch first** with an optional canary pre-restart gate that aborts the restart when an ephemeral boot fails. New in **v0.5.0** it **auto-detects the systemd unit** from `/proc/self/cgroup`, so the tool and the canary work with zero config on systemd-managed installs.
 
@@ -12,7 +15,6 @@ A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of serv
 ## Table of contents
 
 - [Overview](#overview)
-- [Demo](#demo)
 - [How it works](#how-it-works)
 - [The `smart_restart` tool](#the-smart_restart-tool)
 - [Canary pre-restart validation](#canary-pre-restart-validation)
@@ -39,12 +41,6 @@ A long-lived DSH instance restarts for many reasons: the agent installs or recon
 - **Precise context** — the notice carries the boot time, the previous boot time, the downtime, and an optional reason.
 - **Canary safety** — an optional pre-restart gate boots an ephemeral DSH instance and aborts the restart when it fails (see below).
 - **Self-contained** — a single host bundle; nothing to run, no external service.
-
-## Demo
-
-![smart_restart demo](assets/demo.gif)
-
-*A short recording: the agent restarts the service with the canary gate on (`Canary: passed — restarting…`), the boot notice returns to the same session, and the agent keeps going — no user prompt needed.*
 
 ## How it works
 
