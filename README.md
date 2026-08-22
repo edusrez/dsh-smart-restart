@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of service restarts — **without the user having to prompt it**. On every boot it detects that a new process has taken over, wakes the target agent with a short "Smart-restart" notice (boot time, previous boot, downtime). New in **v0.2.0** it added the `smart_restart` tool to **restart DSH itself** and return the notice to the exact session that asked; new in **v0.3.0** it **auto-detects** when the service was stopped while an agent session was active, so even a *plain* `systemctl restart` the agent ran notifies that session at boot; new in **v0.4.0** it can **validate the launch first** with an optional canary pre-restart gate that aborts the restart when an ephemeral boot fails.
+A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of service restarts — **without the user having to prompt it**. On every boot it detects that a new process has taken over, wakes the target agent with a short "Smart-restart" notice (boot time, previous boot, downtime). New in **v0.2.0** it added the `smart_restart` tool to **restart DSH itself** and return the notice to the exact session that asked; new in **v0.3.0** it **auto-detects** when the service was stopped while an agent session was active, so even a *plain* `systemctl restart` the agent ran notifies that session at boot; new in **v0.4.0** it can **validate the launch first** with an optional canary pre-restart gate that aborts the restart when an ephemeral boot fails. New in **v0.5.0** it **auto-detects the systemd unit** from `/proc/self/cgroup`, so the tool and the canary work with zero config on systemd-managed installs.
 
 [![npm](https://img.shields.io/npm/v/dsh-smart-restart?style=flat-square&logo=npm)](https://www.npmjs.com/package/dsh-smart-restart)
 [![license](https://img.shields.io/npm/l/dsh-smart-restart?style=flat-square)](LICENSE)
@@ -108,7 +108,7 @@ Registered via `ctx.tools.register` in `apply` (so it is available to agent sess
 **Behavior**
 
 - Validates the configured `restartUnit` — a single systemd unit token (`/^[A-Za-z0-9_.@-]+$/`, no spaces/slashes) to prevent shell injection into the detached command.
-- **Fails fast** when `restartUnit` is not configured (`ok: false`, error `restartUnit not configured`) rather than guessing a unit.
+- **Fails fast** when `restartUnit` is not configured **and** auto-detection from `/proc/self/cgroup` finds no unit either (`ok: false`, error `restartUnit not configured`) rather than guessing a unit — an empty `restartUnit` is auto-detected first, and only a failed detection produces that error.
 - Persists `pending-notice.json` **synchronously** (before any spawn) so it survives the service kill and targets the restarting session.
 - Restarts via a **detached** `setsid bash` process (`sleep 1 && systemctl restart <unit>`) that outlives this process, then unrefs it.
 - Returns `{ok: true, restarting: true, sessionId, reason}` on success, or `{ok: false, restarting: false, error}` when it fails.
@@ -131,7 +131,7 @@ install/change a plugin
 ## Canary pre-restart validation
 
 > **New in v0.4.0.** Optional, opt-in, and fully generic — it works on any DSH
-> install: `restartUnit` remains the only required tool config.
+> install: `restartUnit` is the only tool config you may need to set (auto-detected since **v0.5.0** when empty on systemd installs).
 
 When enabled, the `smart_restart` tool can validate the launch **before** anything is persisted or restarted: it boots an **ephemeral DSH instance** from the same binary and profile as the systemd unit, verifies it starts, and only then proceeds with the real `systemctl restart`. A failed canary **aborts the restart** — no pending notice is written, nothing is spawned, and the calling session is alerted live (same plugin-source notice channel).
 
@@ -177,7 +177,7 @@ ABORTED: <detail>`, or `Canary: skipped — <detail>`).
 ## Requirements
 
 - **DSH `>= 0.1.0-rc.7`** — a **long-lived instance with a live main-agent session** (the web / GUI profile). This plugin is designed for a continuously-running service whose main agent stays resident; it is **not** aimed at the one-shot headless CLI.
-- **systemd-managed DSH install** for the `smart_restart` tool — it restarts the service through `setsid`/`systemctl`. Since **v0.5.0** the tool **auto-detects its own systemd unit** from `/proc/self/cgroup`, so no `restartUnit` config is needed; the detected unit must be a real systemd unit (e.g. `dsh.service`).
+- **systemd-managed DSH install** for the `smart_restart` tool — v0.5.0 auto-detects the service unit from `/proc/self/cgroup`; set `restartUnit` explicitly when the unit differs or on non-systemd (where the tool fails safe).
 - **Node.js / pnpm** — the usual DSH toolchain for building and installing host bundles.
 
 ## Install
@@ -330,11 +330,11 @@ Be honest about what this plugin does not do:
 
 ```
 src/
-  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool (incl. the optional canary gate + abort alert), delivery (followup/inject)
+  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool (incl. the optional canary gate + abort alert, restartUnit auto-detection — resolveRestartUnit reads /proc/self/cgroup when config empty), delivery (followup/inject)
   boot.ts    — pure, deterministic restart + notice logic (I/O-free, unit-testable), incl. parseShutdownNotice / shutdownTarget
   canary.ts  — optional canary pre-restart validation: ExecStart derivation, temp patch build, free-port pick, dump-config pre-flight, boot + liveness probe (all IO injectable via CanaryHooks)
 test/
-  marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / selectsAgent / targetsAgent / compiled exports
+  marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / parseCgroupUnit / selectsAgent / targetsAgent / compiled exports
   notice.test.js  — buildNotice / humanizeDowntime
   canary.test.js  — deriveExecStartParams / buildPatchContent / pickFreePort / probeStatusHealthy / resolveExecTarget / runCanary with injected hooks
 ```
