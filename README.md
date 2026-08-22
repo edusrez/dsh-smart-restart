@@ -12,6 +12,7 @@ A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of serv
 ## Table of contents
 
 - [Overview](#overview)
+- [Demo](#demo)
 - [How it works](#how-it-works)
 - [The `smart_restart` tool](#the-smart_restart-tool)
 - [Canary pre-restart validation](#canary-pre-restart-validation)
@@ -38,6 +39,12 @@ A long-lived DSH instance restarts for many reasons: the agent installs or recon
 - **Precise context** — the notice carries the boot time, the previous boot time, the downtime, and an optional reason.
 - **Canary safety** — an optional pre-restart gate boots an ephemeral DSH instance and aborts the restart when it fails (see below).
 - **Self-contained** — a single host bundle; nothing to run, no external service.
+
+## Demo
+
+![smart_restart demo](assets/demo.gif)
+
+*A short recording: the agent restarts the service with the canary gate on (`Canary: passed — restarting…`), the boot notice returns to the same session, and the agent keeps going — no user prompt needed.*
 
 ## How it works
 
