@@ -180,7 +180,7 @@ ABORTED: <detail>`, or `Canary: skipped — <detail>`).
 
 ## Requirements
 
-- **DSH `>= 0.1.0-rc.7`** — a **long-lived instance with a live main-agent session** (the web / GUI profile). This plugin is designed for a continuously-running service whose main agent stays resident; it is **not** aimed at the one-shot headless CLI.
+- **DSH `0.1.0-rc.7+` / `0.1.1-rc.x`** — a **long-lived instance with a live main-agent session** (the web / GUI profile). This plugin is designed for a continuously-running service whose main agent stays resident; it is **not** aimed at the one-shot headless CLI.
 - **systemd-managed DSH install** for the `smart_restart` tool — v0.5.0 auto-detects the service unit from `/proc/self/cgroup`; set `restartUnit` explicitly when the unit differs or on non-systemd (where the tool fails safe).
 - **Node.js / pnpm** — the usual DSH toolchain for building and installing host bundles.
 
@@ -328,7 +328,7 @@ Be honest about what this plugin does not do:
 - **Tool requires a systemd unit.** Since **v0.5.0** the `smart_restart` tool **auto-detects the plugin's own unit from `/proc/self/cgroup`** on systemd-managed installs — no `restartUnit` config needed. On a host where no unit is detectable (a bare non-systemd process), the tool still fails safe: set `restartUnit` explicitly to override the auto-detected unit or to enable the tool there. Non-tool restarts are still auto-detected when an agent was active within `shutdownGraceMs`, otherwise they fall back to `target`.
 - **Canary adds latency.** A canary-gated call blocks the tool for up to `canaryTimeoutMs` (default 45s) while the ephemeral instance boots and is probed; disable the canary (or lower the timeout) for fast, low-risk restarts. The canary validates config/compose + boot health, not the `systemctl restart` command itself (the restart remains fire-and-forget).
 - **Existing sessions may lack the tool.** A session whose toolset was created **before** the plugin was installed won't have `smart_restart` — start a new chat after installing to pick it up.
-- **rc-era API.** The plugin targets DSH `>= 0.1.0-rc.7`; pre-1.0 APIs (events, session ids, message forms) may change in later releases.
+- **rc-era API.** The plugin targets DSH `0.1.0-rc.7+` / `0.1.1-rc.x`; pre-1.0 APIs (events, session ids, message forms) may change in later releases.
 
 ## Development
 

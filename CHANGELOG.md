@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-08-22
+
+### Fixed
+
+- **peerDependencies cover the DSH `0.1.1-rc.x` prerelease line.** The `@deepseek-ai/dsh-*` peers (`dsh-agent`, `dsh-llm`, `dsh-session`, `dsh-home-paths`, `dsh-tools`) now declare `^0.1.0-rc.7 || ^0.1.1-rc.0`. Under npm's prerelease-tuple rule, the previous single range `^0.1.0-rc.7` silently excluded every `0.1.1-rc.x` build of the harness (e.g. the current `0.1.1-rc.2`), so users on the current harness line hit an ERESOLVE they had to work around by hand. The README compatibility claim is updated to match — DSH `0.1.0-rc.7+` / `0.1.1-rc.x`.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added

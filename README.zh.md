@@ -127,7 +127,7 @@ install/change a plugin
 
 ## 环境要求
 
-- **DSH `>= 0.1.0-rc.7`** — 一个**长期运行、带有实时主代理会话的实例**（web / GUI profile）。该插件专为持续运行、主代理保持驻留的服务而设计；它**不**面向一次性 headless CLI。
+- **DSH `0.1.0-rc.7+` / `0.1.1-rc.x`** — 一个**长期运行、带有实时主代理会话的实例**（web / GUI profile）。该插件专为持续运行、主代理保持驻留的服务而设计；它**不**面向一次性 headless CLI。
 - 使用 `smart_restart` 工具需要 **systemd 托管的 DSH 安装** — v0.5.0 会从 `/proc/self/cgroup` 自动检测服务单元；当单元不同或处于非 systemd 环境（工具在那里安全失败）时，请显式设置 `restartUnit`。
 - **Node.js / pnpm** — 构建和安装宿主包常用的 DSH 工具链。
 
@@ -260,7 +260,7 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
 - **按 DSH-home 的标记。** 标记存放在单个 `<DSH_HOME>` 下，因此不同的 home（例如你的稳定实例与开发实例）会被独立跟踪——重启其一不会通知另一个中的代理。
 - **工具需要 systemd 单元。** 自 **v0.5.0** 起，`smart_restart` 工具在 systemd 托管的安装中会**从 `/proc/self/cgroup` 自动检测插件自身的单元** —— **无需 `restartUnit` 配置**。在无法检测到单元的主机上（裸的非 systemd 进程），工具仍会安全失败：显式设置 `restartUnit` 可覆盖自动检测到的单元，或在那里启用工具。当代理在 `shutdownGraceMs` 内处于活动状态时，非工具重启仍会被自动检测，否则回退到 `target`。
 - **既有会话可能缺少该工具。** 在安装插件**之前**创建的、其工具集已生成的会话不会有 `smart_restart` —— 安装后请新开聊天以获取它。
-- **rc 时代 API。** 该插件面向 DSH `>= 0.1.0-rc.7`；1.0 之前的 API（事件、会话 id、消息形式）在后续版本中可能发生变化。
+- **rc 时代 API。** 该插件面向 DSH `0.1.0-rc.7+` / `0.1.1-rc.x`；1.0 之前的 API（事件、会话 id、消息形式）在后续版本中可能发生变化。
 
 ## 开发
 
