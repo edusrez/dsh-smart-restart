@@ -1,6 +1,7 @@
 # dsh-smart-restart
 
 English | [中文](README.zh.md)
+
 ![dsh-smart-restart demo — real-time restart](assets/demo.gif)
 
 *A real-time restart: the agent restarts the service (canary pre-flight passing, `Canary: passed — restarting…`), and the plugin's boot notification brings the very same session right back — the conversation continues automatically, no user prompt needed.*
