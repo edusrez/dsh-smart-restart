@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-22
+
+### Added
+
+- **Systemd unit auto-detection** from `/proc/self/cgroup`. When `restartUnit` is empty (the default), the plugin now detects its **OWN systemd unit** at apply — so the `smart_restart` tool (restart target) and the canary's `ExecStart` derivation work with **zero config** on a systemd-managed DSH install. An explicit `restartUnit` always wins; a process with no readable/detectable unit keeps the existing fail-safe (`restartUnit not configured`).
+- Pure-logic unit tests for `parseCgroupUnit` (unified hierarchy, extra whitespace, multi-line "last matching segment wins", instance units `foo@bar.service`, and non-`.service` / empty / malformed inputs).
+
 ## [0.4.1] - 2026-08-22
 
 ### Fixed

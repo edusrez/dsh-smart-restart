@@ -204,6 +204,37 @@ export function parseShutdownNotice(raw: string): ShutdownNotice | null {
   }
 }
 
+/** Systemd unit token rule for cgroup-derived units — the same rule the
+ *  smart_restart tool guard applies in index.ts: a single unit token, no
+ *  spaces, slashes, or shell metacharacters. */
+const UNIT_TOKEN_RE = /^[A-Za-z0-9_.@-]+$/
+
+/**
+ * Parse the plugin's OWN systemd unit name from `/proc/self/cgroup` content.
+ *
+ * Reads cgroup text (one or more lines; typically the unified hierarchy line
+ * `0::/system.slice/foo.service`). It returns the LAST path segment ending in
+ * `.service` across all lines — exactly one line/segment is expected in
+ * practice, but the parser is tolerant: trailing whitespace is stripped and
+ * malformed lines are ignored. The candidate must match the unit token rule
+ * (`/^[A-Za-z0-9_.@-]+$/`) before it is returned. Returns null when no line
+ * has a usable `.service` segment: no `.service` present (e.g. a user-slice
+ * scope), empty/whitespace-only text, or a malformed token.
+ */
+export function parseCgroupUnit(cgroupText: string): string | null {
+  if (typeof cgroupText !== 'string' || !cgroupText.trim()) return null
+  let found: string | null = null
+  for (const rawLine of cgroupText.split('\n')) {
+    const line = rawLine.trim()
+    if (!line) continue
+    const segment = line.split('/').pop() ?? ''
+    if (!segment.endsWith('.service')) continue
+    if (!UNIT_TOKEN_RE.test(segment)) continue
+    found = segment
+  }
+  return found
+}
+
 /**
  * Whether a session id should be excluded from the "last active" selection.
  *

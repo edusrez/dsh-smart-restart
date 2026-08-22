@@ -37,6 +37,7 @@ import {
   buildNotice,
   detectRestart,
   ignoredByPrefix,
+  parseCgroupUnit,
   parsePendingNotice,
   parseShutdownNotice,
   selectsAgent,
@@ -148,9 +149,40 @@ function discoverDshVersion(): string | undefined {
   }
 }
 
+/**
+ * Resolve the systemd unit the smart_restart tool should restart.
+ *
+ * An explicit `restartUnit` always wins. When it is empty, auto-detect this
+ * process's OWN systemd unit from `/proc/self/cgroup` (v0.5.0), so the tool
+ * (and the canary's ExecStart derivation via the effective restartUnit) work
+ * with ZERO config on a systemd-managed DSH install. A process with no
+ * readable/detectable unit (e.g. a bare non-systemd process) keeps the
+ * existing fail-safe: an empty unit → the tool guard rejects with
+ * 'restartUnit not configured'.
+ */
+function resolveRestartUnit(restartUnit: string): string {
+  if (restartUnit) return restartUnit
+  try {
+    const text = readFileSync('/proc/self/cgroup', 'utf8')
+    const unit = parseCgroupUnit(text)
+    if (unit) {
+      console.log(`[smart-restart] restartUnit auto-detected: ${unit}`)
+      return unit
+    }
+  } catch {
+    // /proc/self/cgroup unreadable — not running under a detectable systemd
+    // unit; the empty unit falls through to the existing fail-safe.
+  }
+  return ''
+}
+
 export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   const config: Config = { ...DEFAULTS, ...cfg }
   if (!config.enabled) return
+
+  // The unit the smart_restart tool (and its canary) should restart: explicit
+  // config wins; empty → auto-detected from /proc/self/cgroup (v0.5.0).
+  const effectiveRestartUnit = resolveRestartUnit(config.restartUnit)
 
   // --- 1. Read the previous marker (tolerate missing / corrupt). ----------
   const markerDir = join(resolveDshHome(), config.stateDir)
@@ -582,7 +614,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           },
         },
         async execute(args, exec): Promise<SmartRestartOutcome> {
-          const guard = guardRestart(config, exec)
+          const guard = guardRestart(effectiveRestartUnit, exec)
           if (!guard.ok) return guard.result
           // --- Optional canary gate (runs after the guards, BEFORE the
           //      pending-notice persist and BEFORE any spawn). ---------------
@@ -591,7 +623,10 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           if (args.canary ?? config.canary) {
             let canary: CanaryResult
             try {
-              canary = await runCanary(ctx, config, args as SmartRestartCall)
+              // The canary receives the EFFECTIVE unit ("already-resolved"):
+              // it derives ExecStart from restartUnit, and an auto-detected
+              // unit is zero-config here too.
+              canary = await runCanary(ctx, { ...config, restartUnit: effectiveRestartUnit }, args as SmartRestartCall)
             } catch (err) {
               canary = { status: 'failed', detail: `canary error: ${String(err)}` }
             }
@@ -608,9 +643,9 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
             }
             // passed / skipped → proceed with the normal restart and carry the
             // canary outcome onto the result.
-            return performRestart(args, exec, markerDir, config, { status: canary.status, detail: canary.detail })
+            return performRestart(args, exec, markerDir, effectiveRestartUnit, { status: canary.status, detail: canary.detail })
           }
-          return performRestart(args, exec, markerDir, config)
+          return performRestart(args, exec, markerDir, effectiveRestartUnit)
         },
       }),
     )
@@ -631,22 +666,24 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
  *
  * Shared by the tool execute flow (which additionally runs the optional canary
  * gate BETWEEN the guards and the pending-notice persist) and by
- * performRestart itself (defense in depth). Returns the resolved unit + calling
- * session id, or a fail-fast tool result to return as-is.
+ * performRestart itself (defense in depth). `restartUnit` is the EFFECTIVE
+ * unit — explicit config or auto-detected from /proc/self/cgroup (v0.5.0).
+ * Returns the resolved unit + calling session id, or a fail-fast tool result
+ * to return as-is.
  */
 function guardRestart(
-  config: Config,
+  restartUnit: string,
   exec: { agent?: { id: unknown } },
 ):
   | { ok: true; unit: string; sessionId: string }
   | { ok: false; result: SmartRestartOutcome } {
-  if (!config.restartUnit) {
+  if (!restartUnit) {
     console.warn('[smart-restart] smart_restart: restartUnit not configured')
     return { ok: false, result: { ok: false, restarting: false, error: 'restartUnit not configured' } }
   }
   // Fail safe: accept a single systemd unit token (no spaces/slashes) to
   // avoid shell injection through restartUnit into the detached command.
-  const unit = config.restartUnit.split(' ')[0]
+  const unit = restartUnit.split(' ')[0]
   if (!UNIT_TOKEN_RE.test(unit)) {
     console.warn('[smart-restart] smart_restart: invalid restartUnit token:', unit)
     return { ok: false, result: { ok: false, restarting: false, error: `invalid restartUnit: ${unit}` } }
@@ -663,11 +700,11 @@ function performRestart(
   args: SmartRestartCall,
   exec: { agent?: { id: unknown } },
   markerDir: string,
-  config: Config,
+  restartUnit: string,
   canary?: { status: 'passed' | 'skipped'; detail: string },
 ): SmartRestartOutcome {
   try {
-    const guard = guardRestart(config, exec)
+    const guard = guardRestart(restartUnit, exec)
     if (!guard.ok) return guard.result
     const { unit, sessionId } = guard
 

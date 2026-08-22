@@ -2,7 +2,7 @@
 // integration check against the compiled plugin (lib/index.js).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { detectRestart, ignoredByPrefix, parsePendingNotice, parseShutdownNotice, selectsAgent, shutdownTarget, targetsAgent } from '../lib/boot.js'
+import { detectRestart, ignoredByPrefix, parseCgroupUnit, parsePendingNotice, parseShutdownNotice, selectsAgent, shutdownTarget, targetsAgent } from '../lib/boot.js'
 
 const NOW = Date.parse('2026-08-18T12:00:00.000Z')
 const PREV = Date.parse('2026-08-18T11:59:00.000Z') // 60_000 ms before NOW
@@ -194,6 +194,42 @@ test('ignoredByPrefix: guards — undefined id and empty prefix set are not igno
   assert.equal(ignoredByPrefix(undefined, ['head-']), false)
   assert.equal(ignoredByPrefix('head-x', []), false)
   assert.equal(ignoredByPrefix('head-x', ['']), false)
+})
+
+// --- v0.5.0: systemd unit auto-detection (parseCgroupUnit) -------------------
+
+test('parseCgroupUnit: unified-hierarchy line yields the unit', () => {
+  assert.equal(parseCgroupUnit('0::/system.slice/dsh-deepartments-dev.service'), 'dsh-deepartments-dev.service')
+})
+
+test('parseCgroupUnit: unified-hierarchy line with extra whitespace', () => {
+  assert.equal(parseCgroupUnit('  0::/system.slice/dsh.service  \n'), 'dsh.service')
+})
+
+test('parseCgroupUnit: instance units (foo@bar.service) are valid', () => {
+  assert.equal(parseCgroupUnit('0::/system.slice/dsh@dev.service'), 'dsh@dev.service')
+})
+
+test('parseCgroupUnit: multi-line cgroup — last matching .service segment wins', () => {
+  const text = '12:cpu:/system.slice/dsh-other.service\n0::/system.slice/dsh-main.service'
+  assert.equal(parseCgroupUnit(text), 'dsh-main.service')
+})
+
+test('parseCgroupUnit: no .service segment (user-slice scope) returns null', () => {
+  assert.equal(parseCgroupUnit('0::/user.slice/user-1000.slice/user-1000-1000.scope'), null)
+  assert.equal(parseCgroupUnit('0::/user.slice/user-1000.slice/session-3.scope'), null)
+})
+
+test('parseCgroupUnit: empty or whitespace-only text returns null', () => {
+  assert.equal(parseCgroupUnit(''), null)
+  assert.equal(parseCgroupUnit('   \n\t '), null)
+})
+
+test('parseCgroupUnit: malformed tokens are rejected (null)', () => {
+  assert.equal(parseCgroupUnit('0::/system.slice/bad unit.service'), null)
+  assert.equal(parseCgroupUnit('0::/system.slice/bad!.service'), null)
+  // a valid-looking unit must be the LAST path segment
+  assert.equal(parseCgroupUnit('0::/system.slice/dsh.service/extra'), null)
 })
 
 // --- Small integration check against the compiled plugin -------------------

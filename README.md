@@ -177,7 +177,7 @@ ABORTED: <detail>`, or `Canary: skipped — <detail>`).
 ## Requirements
 
 - **DSH `>= 0.1.0-rc.7`** — a **long-lived instance with a live main-agent session** (the web / GUI profile). This plugin is designed for a continuously-running service whose main agent stays resident; it is **not** aimed at the one-shot headless CLI.
-- **systemd-managed DSH install** for the `smart_restart` tool — it restarts the service through `setsid`/`systemctl`, so the unit named in `restartUnit` must be a real systemd unit (e.g. `dsh.service`).
+- **systemd-managed DSH install** for the `smart_restart` tool — it restarts the service through `setsid`/`systemctl`. Since **v0.5.0** the tool **auto-detects its own systemd unit** from `/proc/self/cgroup`, so no `restartUnit` config is needed; the detected unit must be a real systemd unit (e.g. `dsh.service`).
 - **Node.js / pnpm** — the usual DSH toolchain for building and installing host bundles.
 
 ## Install
@@ -205,16 +205,20 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
         target: primary
         wakeup: true
         notice: ''
-        restartUnit: ''   # REQUIRED per profile for smart_restart to work
+        restartUnit: ''   # OPTIONAL since v0.5.0 — auto-detected on systemd installs; set explicitly when the unit differs
         toolEnabled: true
 ```
 
-> **You MUST set `restartUnit` per profile.** The `smart_restart` tool only
-> works when `restartUnit` names the systemd unit for that DSH instance. Add a
-> `cordis.patch.yml` override on the `smart-restart` row — **restating the full
-> config** (a partial override would drop the other keys) — with the unit for
-> that profile. For example, for the stable instance and the dev instance
-> respectively:
+> **`restartUnit` is OPTIONAL since v0.5.0 on systemd installs.** The plugin
+> auto-detects its **own systemd unit** from `/proc/self/cgroup`, so the
+> `smart_restart` tool (and the canary's `ExecStart` derivation) work with
+> **zero config** on a systemd-managed DSH install. Set `restartUnit`
+> explicitly when the unit name differs from the auto-detected one or when
+> detection is unavailable (e.g. a bare non-systemd process). If you DO set
+> it, add a `cordis.patch.yml` override on the `smart-restart` row —
+> **restating the full config** (a partial override would drop the other keys)
+> — with the unit for that profile. For example, for the stable instance and
+> the dev instance respectively:
 
 ```yaml
 # Override on the smart-restart row — profile "stable" (dsh.service)
@@ -244,7 +248,7 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
         toolEnabled: true
 ```
 
-Because the bundle declares `dsh.bundle`, the layer auto-joins `dsh.profile.bundles` on install — no manual profile edit required beyond the per-profile `restartUnit` override.
+Because the bundle declares `dsh.bundle`, the layer auto-joins `dsh.profile.bundles` on install — no manual profile edit required. `restartUnit` is **usually auto-detected** (v0.5.0); add the explicit override above only when the unit name differs or detection is unavailable.
 
 ## Configuration
 
@@ -257,7 +261,7 @@ All behavior is controlled through the plugin row's `config`:
 | `target`      | string  | `primary`         | Which agent(s) to notify when there is **no** pending/shutdown notice: `primary` \| `all` \| `<session-id>`. |
 | `wakeup`      | boolean | `true`            | `true` → `agent.followup()` wakes the agent and delivers; `false` → `agent.inject()` queues model-facing context only (no wake). |
 | `notice`      | string  | `''`              | Optional custom notice text; returned verbatim when non-empty, else the default. |
-| `restartUnit` | string  | `''`              | Systemd unit to restart when `smart_restart` is invoked (e.g. `dsh.service` or `dsh-deepartments-dev.service`). Must be set per profile; empty → the tool fails safe with a clear error. |
+| `restartUnit` | string  | `''`              | Systemd unit to restart when `smart_restart` is invoked (e.g. `dsh.service` or `dsh-deepartments-dev.service`). Since **v0.5.0** it is **auto-detected from `/proc/self/cgroup`** (the plugin's own unit) when empty; an explicit value always wins. Empty with no detectable unit → the tool fails safe with a clear error. |
 | `toolEnabled` | boolean | `true`            | Whether the `smart_restart` tool is registered (available to agent sessions). |
 | `shutdownGraceMs` | number | `600000`          | Grace window (ms, default 10 minutes) before shutdown within which last agent activity counts as "agent-involved" for the smart shutdown auto-notification. If the last-active session was idle beyond this window on shutdown, the pin is skipped and delivery falls back to `target`. |
 | `ignoredSessionPrefixes` | string[] | `['head-']` | Session-id prefixes that must never be selected as "last active" for the smart-shutdown auto-notification, so Deepartments department-head sessions (`head-<postId>`) don't get a spurious post-restart notice. Configurable list; default ON (heads skipped). |
@@ -317,7 +321,7 @@ Be honest about what this plugin does not do:
 - **Agent-side awareness only.** There is no desktop or browser toast — DSH currently has no notification service, so the notice surfaces only in the agent's own context (visible in the GUI session, not as an OS/browser notification).
 - **Not for the one-shot headless CLI.** A boot-time wake may not exit cleanly in a single-shot headless run; this plugin targets long-lived GUI instances. The notice is still delivered and committed, but for headless one-shots it is of little use.
 - **Per-DSH-home marker.** The marker lives under a single `<DSH_HOME>`, so separate homes (e.g. your stable vs. dev instance) are tracked independently — a restart of one does not notify agents in the other.
-- **Tool requires restartUnit.** The `smart_restart` tool needs a configured `restartUnit`; without it the tool fails safe. Non-tool restarts are still auto-detected when an agent was active within `shutdownGraceMs`, otherwise they fall back to `target`.
+- **Tool requires a systemd unit.** Since **v0.5.0** the `smart_restart` tool **auto-detects the plugin's own unit from `/proc/self/cgroup`** on systemd-managed installs — no `restartUnit` config needed. On a host where no unit is detectable (a bare non-systemd process), the tool still fails safe: set `restartUnit` explicitly to override the auto-detected unit or to enable the tool there. Non-tool restarts are still auto-detected when an agent was active within `shutdownGraceMs`, otherwise they fall back to `target`.
 - **Canary adds latency.** A canary-gated call blocks the tool for up to `canaryTimeoutMs` (default 45s) while the ephemeral instance boots and is probed; disable the canary (or lower the timeout) for fast, low-risk restarts. The canary validates config/compose + boot health, not the `systemctl restart` command itself (the restart remains fire-and-forget).
 - **Existing sessions may lack the tool.** A session whose toolset was created **before** the plugin was installed won't have `smart_restart` — start a new chat after installing to pick it up.
 - **rc-era API.** The plugin targets DSH `>= 0.1.0-rc.7`; pre-1.0 APIs (events, session ids, message forms) may change in later releases.
