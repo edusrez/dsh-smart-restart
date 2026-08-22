@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-一个 **DeepSeek Harness (DSH) 宿主插件**，让主代理在服务重启后保持感知——**无需用户主动提示**。每次启动时，它都会检测到新进程已经接管，并以一条简短的“Smart-restart”通知唤醒目标代理（启动时间、上一次启动时间、停机时长）。**v0.2.0** 新增了 `smart_restart` 工具，用于**重启 DSH 本身**，并将通知返回到发起请求的那一个会话；**v0.3.0** 新增了在代理会话处于活动状态期间服务被停止时的**自动检测**功能，因此即使是代理运行过的*普通* `systemctl restart`，也会在启动时通知该会话。
+一个 **DeepSeek Harness (DSH) 宿主插件**，让主代理在服务重启后保持感知——**无需用户主动提示**。每次启动时，它都会检测到新进程已经接管，并以一条简短的“Smart-restart”通知唤醒目标代理（启动时间、上一次启动时间、停机时长）。**v0.2.0** 新增了 `smart_restart` 工具，用于**重启 DSH 本身**，并将通知返回到发起请求的那一个会话；**v0.3.0** 新增了在代理会话处于活动状态期间服务被停止时的**自动检测**功能，因此即使是代理运行过的*普通* `systemctl restart`，也会在启动时通知该会话；**v0.4.0** 新增了**先校验再启动**的能力——通过可选的 canary 预重启门控，在临时实例启动失败时中止重启；新版本 **v0.5.0** 支持**自动检测 systemd 服务单元**（读取 `/proc/self/cgroup`），在 systemd 托管的安装中，工具与 canary 无需任何配置即可工作。
 
 [![npm](https://img.shields.io/npm/v/dsh-smart-restart?style=flat-square&logo=npm)](https://www.npmjs.com/package/dsh-smart-restart)
 [![license](https://img.shields.io/npm/l/dsh-smart-restart?style=flat-square)](LICENSE)
@@ -105,7 +105,7 @@
 **行为**
 
 - 校验配置好的 `restartUnit` — 单个 systemd 单元令牌（`/^[A-Za-z0-9_.@-]+$/`，不含空格/斜杠），以防对分离命令进行 shell 注入。
-- 当 `restartUnit` 未配置时**快速失败**（`ok: false`，错误 `restartUnit not configured`），而不是猜测单元名。
+- 当 `restartUnit` 未配置**且**从 `/proc/self/cgroup` 的自动检测也找不到单元时**快速失败**（`ok: false`，错误 `restartUnit not configured`），而不是猜测单元名——空的 `restartUnit` 会先被自动检测，只有检测失败才会产生该错误。
 - **同步**持久化 `pending-notice.json`（在任何 spawn 之前），以便在服务终止时存活，并定向到正在重启的会话。
 - 通过一个**分离的** `setsid bash` 进程（`sleep 1 && systemctl restart <unit>`）重启，该进程比本进程存活更久，然后对其 unref。
 - 成功时返回 `{ok: true, restarting: true, sessionId, reason}`，失败时返回 `{ok: false, restarting: false, error}`。
@@ -128,7 +128,7 @@ install/change a plugin
 ## 环境要求
 
 - **DSH `>= 0.1.0-rc.7`** — 一个**长期运行、带有实时主代理会话的实例**（web / GUI profile）。该插件专为持续运行、主代理保持驻留的服务而设计；它**不**面向一次性 headless CLI。
-- 使用 `smart_restart` 工具需要 **systemd 托管的 DSH 安装** — 它通过 `setsid`/`systemctl` 重启服务，因此 `restartUnit` 中命名的单元必须是真实的 systemd 单元（例如 `dsh.service`）。
+- 使用 `smart_restart` 工具需要 **systemd 托管的 DSH 安装** — v0.5.0 会从 `/proc/self/cgroup` 自动检测服务单元；当单元不同或处于非 systemd 环境（工具在那里安全失败）时，请显式设置 `restartUnit`。
 - **Node.js / pnpm** — 构建和安装宿主包常用的 DSH 工具链。
 
 ## 安装
@@ -156,15 +156,19 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
         target: primary
         wakeup: true
         notice: ''
-        restartUnit: ''   # REQUIRED per profile for smart_restart to work
+        restartUnit: ''   # OPTIONAL since v0.5.0 — auto-detected on systemd installs; set explicitly when the unit differs
         toolEnabled: true
 ```
 
-> **每个 profile 都必须设置 `restartUnit`。** `smart_restart` 工具只有
-> 在 `restartUnit` 命名了该 DSH 实例的 systemd 单元时才起作用。在
-> `smart-restart` 行上添加一个 `cordis.patch.yml` 覆盖 —— **重申完整的
-> config**（部分覆盖会丢弃其他键）—— 使用该 profile 的单元。例如，分别
-> 针对稳定实例和开发实例：
+> **`restartUnit` 自 v0.5.0 起在 systemd 安装中为可选。** 安装时，它可能是
+> 你唯一需要设置的配置（v0.5.0 起为空时会在 systemd 安装中自动检测）。插件
+> 会从 `/proc/self/cgroup` 自动检测其**自身的 systemd 单元**，因此
+> `smart_restart` 工具（以及 canary 的 `ExecStart` 推导）在 systemd 托管的
+> DSH 安装中**零配置**即可工作。当单元名与自动检测到的不同，或检测不可用
+> （例如裸的非 systemd 进程）时，请显式设置 `restartUnit`。如果你确实要
+> 设置它，请在 `smart-restart` 行上添加一个 `cordis.patch.yml` 覆盖 ——
+> **重申完整的 config**（部分覆盖会丢弃其他键）—— 使用该 profile 的单元。
+> 例如，分别针对稳定实例和开发实例：
 
 ```yaml
 # Override on the smart-restart row — profile "stable" (dsh.service)
@@ -194,7 +198,7 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
         toolEnabled: true
 ```
 
-由于该包声明了 `dsh.bundle`，该层会在安装时自动加入 `dsh.profile.bundles` —— 除了按 profile 覆盖 `restartUnit` 之外，无需手动编辑 profile。
+由于该包声明了 `dsh.bundle`，该层会在安装时自动加入 `dsh.profile.bundles` —— 无需手动编辑 profile。`restartUnit` **通常会被自动检测**（v0.5.0）；仅当单元名不同或检测不可用时，才添加上面的显式覆盖。
 
 ## 配置
 
@@ -207,7 +211,7 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
 | `target`      | string  | `primary`         | 当**没有**待处理/关机通知时通知哪个/哪些代理：`primary` \| `all` \| `<session-id>`。 |
 | `wakeup`      | boolean | `true`            | `true` → `agent.followup()` 唤醒代理并投递；`false` → `agent.inject()` 仅排队面向模型的上下文（不唤醒）。 |
 | `notice`      | string  | `''`              | 可选的自定义通知文本；非空时原样返回，否则使用默认文本。 |
-| `restartUnit` | string  | `''`              | 调用 `smart_restart` 时重启的 systemd 单元（例如 `dsh.service` 或 `dsh-deepartments-dev.service`）。必须按 profile 设置；为空 → 工具以清晰错误安全失败。 |
+| `restartUnit` | string  | `''`              | 调用 `smart_restart` 时重启的 systemd 单元（例如 `dsh.service` 或 `dsh-deepartments-dev.service`）。自 **v0.5.0** 起，为空时会**从 `/proc/self/cgroup` 自动检测**（插件自身的单元）；显式值始终优先。为空且检测不到单元 → 工具以清晰错误安全失败。 |
 | `toolEnabled` | boolean | `true`            | 是否注册 `smart_restart` 工具（是否对代理会话可用）。 |
 | `shutdownGraceMs` | number | `600000`          | 关闭前的时间窗口（毫秒，默认 10 分钟），其间最近一次代理活动计为“涉及代理”，用于智能关机自动通知。如果在关机时最近一次活动的会话空闲时间超过了该窗口，则跳过固定，投递回退到 `target`。 |
 | `ignoredSessionPrefixes` | string[] | `['head-']` | 永远不会被选为“最近活动”以用于智能关机自动通知的会话 id 前缀，因此 Deepartments 部门头部会话（`head-<postId>`）不会收到多余的重启后通知。可配置的列表；默认开启（跳过头部会话）。 |
@@ -254,7 +258,7 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
 - **仅代理侧感知。** 没有桌面或浏览器 toast —— DSH 目前没有通知服务，因此通知只出现在代理自身的上下文中（在 GUI 会话中可见，而不是作为 OS/浏览器通知）。
 - **不适用于一次性 headless CLI。** 启动时的唤醒可能在单次 headless 运行中无法干净退出；本插件面向长期运行的 GUI 实例。通知仍会被投递和提交，但对于 headless 一次性运行来说意义不大。
 - **按 DSH-home 的标记。** 标记存放在单个 `<DSH_HOME>` 下，因此不同的 home（例如你的稳定实例与开发实例）会被独立跟踪——重启其一不会通知另一个中的代理。
-- **工具需要 restartUnit。** `smart_restart` 工具需要配置好的 `restartUnit`；没有时工具安全失败。当代理在 `shutdownGraceMs` 内处于活动状态时，非工具重启仍会被自动检测，否则回退到 `target`。
+- **工具需要 systemd 单元。** 自 **v0.5.0** 起，`smart_restart` 工具在 systemd 托管的安装中会**从 `/proc/self/cgroup` 自动检测插件自身的单元** —— **无需 `restartUnit` 配置**。在无法检测到单元的主机上（裸的非 systemd 进程），工具仍会安全失败：显式设置 `restartUnit` 可覆盖自动检测到的单元，或在那里启用工具。当代理在 `shutdownGraceMs` 内处于活动状态时，非工具重启仍会被自动检测，否则回退到 `target`。
 - **既有会话可能缺少该工具。** 在安装插件**之前**创建的、其工具集已生成的会话不会有 `smart_restart` —— 安装后请新开聊天以获取它。
 - **rc 时代 API。** 该插件面向 DSH `>= 0.1.0-rc.7`；1.0 之前的 API（事件、会话 id、消息形式）在后续版本中可能发生变化。
 
