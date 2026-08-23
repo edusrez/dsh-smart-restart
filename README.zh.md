@@ -14,6 +14,7 @@
 - [概述](#概述)
 - [工作原理](#工作原理)
 - [`smart_restart` 工具](#smart_restart-工具)
+- [Canary 预重启校验](#canary-预重启校验)
 - [环境要求](#环境要求)
 - [安装](#安装)
 - [配置](#配置)
@@ -101,6 +102,7 @@
 | 参数    | 类型   | 必填 | 描述 |
 | -------- | ------ | -------- | ----------- |
 | `reason` | string | 否       | 可选的人类可读说明，例如 `"installed dshmarket in stable+dev"`。会包含在重启后的通知中。 |
+| `canary` | boolean | 否       | 针对本次调用的可选 canary 预重启校验：会启动一个临时 DSH 实例，并在失败时中止重启（参见 [Canary 预重启校验](#canary-预重启校验)）。会覆盖本次调用的已配置 `canary`。 |
 
 **行为**
 
@@ -124,6 +126,55 @@ install/change a plugin
 
 - 单元令牌会针对严格的正则进行校验，以阻止通过 `restartUnit` 对分离 shell 命令进行 shell 注入。
 - 该工具面向 **systemd 托管**的 DSH 安装（`setsid` / `systemctl`）；它不适用于没有 systemd 单元的裸进程。
+
+## Canary 预重启校验
+
+> **v0.4.0 新增。** 可选、opt-in，且完全通用——它适用于任何 DSH
+> 安装：`restartUnit` 是你唯一可能需要设置的工具配置（自 **v0.5.0** 起在
+> systemd 安装中为空时会自动检测）。
+
+启用后，`smart_restart` 工具可以在**任何内容被持久化或重启之前**校验启动：
+它会用一个与 systemd 单元相同的二进制和 profile 启动一个**临时 DSH 实例**，
+校验它能启动，然后才真正执行 `systemctl restart`。canary 失败会**中止重启**——
+不会写入任何待处理通知、不会派生任何东西，并且会实时告知调用它的会话（走同一个
+插件来源的通知通道）。
+
+**它一步步做什么**
+
+1. **解析 dsh 二进制/profile** —— 显式的 `canaryBinary` / `canaryProfile` 优先；否则两者都从 `systemctl show -p ExecStart <restartUnit>` 推导（二进制回退到 PATH 上的 `dsh`）。当解析不到 profile 时省略 `--profile` 标志。
+2. **创建临时状态目录和临时补丁覆盖层**（`dsh --patch <tmp>/canary.patch.yml`，在 profile 层之后应用）：`smart-restart` 行本身在 canary 中被禁用（`enabled: false`），并且每一条 `canaryStateDirOverrides` 条目将其 `stateDir` 重定向到临时目录——因此 canary 永不写入 marker、通知或实时 board 状态。
+3. **用 `--dump-config` 预检启动**（20s 超时；组合失败会中止重启）。
+4. **分离启动临时实例**，使用相同的覆盖层，监听自动挑选的空闲端口（设置了 `canaryPort` 时用指定端口），并**轮询** `http://127.0.0.1:<port>/` 直到 HTTP 200 或 `canaryTimeoutMs` 到期（每次尝试 800ms；拒绝连接或非 200 视为"尚未就绪"）。
+5. **停止临时实例**（进程组 kill）并返回：`passed` → 重启继续；`failed` → 中止 + 告知调用者；`skipped` → 重启继续（skip 不是失败）。
+
+**何时跳过（绝不阻塞）** —— 如果无法推导出 dsh 二进制/profile（没有 `systemctl` 查询结果且没有显式的 `canaryBinary`/`canaryProfile`），canary 报告 `skipped`，重启原样继续。因此通用安装永远是安全的：只有当*你*用一个可解析的实际启动目标 opt-in 时，canary 失败才会中止重启。
+
+**如何启用**
+
+- **按 profile**：在 `smart-restart` 行添加 `canary: true`（外加任何覆盖）。按 profile 的补丁行会**替换**该行的整个 config，因此要复述你现有的字段（参见 [配置](#配置) 中的示例）。
+- **按调用**（面向代理）：调用 `smart_restart(canary: true, reason)`，它会针对那单次调用覆盖已配置的默认值。
+
+**配置字段**
+
+| 键 | 类型 | 默认值 | 描述 |
+| --- | --- | --- | --- |
+| `canary` | boolean | `false` | canary 门控的总开关。 |
+| `canaryTimeoutMs` | number | `45000` | canary 启动存活探测的硬性时间窗口（毫秒）；超时即判断为 canary 失败并中止重启。 |
+| `canaryPort` | number | `0` | 临时 canary 实例的 HTTP 端口；`0` 表示自动挑选空闲端口。 |
+| `canaryProfile` | string | `''` | canary 启动所需的显式 dsh profile；为空时从单元的 `ExecStart`（`--profile`）推导。 |
+| `canaryBinary` | string | `''` | canary 启动所需的显式 dsh 二进制；为空时从单元的 `ExecStart` 推导，否则用 PATH 上的 `dsh`。 |
+| `canaryStateDirOverrides` | object | `{}` | 插件行 id → 临时目录；这些行的 `stateDir` 会在 canary 补丁中重定向到该临时目录（例如 `deepartments: ''` 让 canary 脱离实时 board 状态）。相对或空值在 canary 临时目录下解析；绝对路径原样使用。 |
+
+> **关于覆盖与行的替换。** 补丁行会替换其所在行的**整个** config（不做
+> 合并）——而 canary 是一次性实例，因此被列出的行只会让 `stateDir` 被覆盖，
+> 其余 config 会回退到该插件自己的默认值。请只对能在默认 config 下正常启动的行
+> 使用 `canaryStateDirOverrides`（实时 profile 的行不被触碰）。在 canary 组合后的
+> 树中不存在的行会被跳过并给出 loader 警告。
+
+**输出** —— 当 canary 运行时，工具结果会携带 `canary`（`passed` /
+`skipped` / `failed`）外加 `canaryDetail`，渲染后的响应会多出一行
+`Canary: …`（`Canary: passed — restarting…`、`Canary: failed — restart
+ABORTED: <detail>`，或 `Canary: skipped — <detail>`）。
 
 ## 环境要求
 
@@ -215,6 +266,12 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
 | `toolEnabled` | boolean | `true`            | 是否注册 `smart_restart` 工具（是否对代理会话可用）。 |
 | `shutdownGraceMs` | number | `600000`          | 关闭前的时间窗口（毫秒，默认 10 分钟），其间最近一次代理活动计为“涉及代理”，用于智能关机自动通知。如果在关机时最近一次活动的会话空闲时间超过了该窗口，则跳过固定，投递回退到 `target`。 |
 | `ignoredSessionPrefixes` | string[] | `['head-']` | 永远不会被选为“最近活动”以用于智能关机自动通知的会话 id 前缀，因此 Deepartments 部门头部会话（`head-<postId>`）不会收到多余的重启后通知。可配置的列表；默认开启（跳过头部会话）。 |
+| `canary` | boolean | `false` | canary 门控的总开关。 |
+| `canaryTimeoutMs` | number | `45000` | canary 启动存活探测的硬性时间窗口（毫秒）；超时即判断为 canary 失败并中止重启。 |
+| `canaryPort` | number | `0` | 临时 canary 实例的 HTTP 端口；`0` 表示自动挑选空闲端口。 |
+| `canaryProfile` | string | `''` | canary 启动所需的显式 dsh profile；为空时从单元的 `ExecStart`（`--profile`）推导。 |
+| `canaryBinary` | string | `''` | canary 启动所需的显式 dsh 二进制；为空时从单元的 `ExecStart` 推导，否则用 PATH 上的 `dsh`。 |
+| `canaryStateDirOverrides` | object | `{}` | 插件行 id → 临时目录；这些行的 `stateDir` 会在 canary 补丁中重定向到该临时目录（例如 `deepartments: ''` 让 canary 脱离实时 board 状态）。相对或空值在 canary 临时目录下解析；绝对路径原样使用。 |
 
 `target` 语义（仅回退路径 —— 待处理通知或可用的关机通知会覆盖当次启动的 `target`）：
 
@@ -239,6 +296,13 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
         shutdownGraceMs: 600000
         ignoredSessionPrefixes:
           - head-
+        canary: true
+        canaryTimeoutMs: 45000
+        canaryPort: 0
+        canaryProfile: ''
+        canaryBinary: ''
+        canaryStateDirOverrides:
+          deepartments: ''
 ```
 
 > **单一投递通道。** 启用 `wakeup` 时通知通过 `agent.followup()` 投递；禁用时通过 `agent.inject()`。同一条消息**绝不会**同时走两者 —— 一条排队进入收件箱的 followup 与同一条消息的并行 inject 会与 Inbox 的“already pending”校验冲突。
@@ -266,11 +330,13 @@ dsh plugin --profile <name> add /path/to/dsh-smart-restart
 
 ```
 src/
-  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool, delivery (followup/inject)
+  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool（含可选的 canary 门控 + 中止告警、restartUnit 自动检测 —— config 为空时 resolveRestartUnit 读取 /proc/self/cgroup）、delivery (followup/inject)
   boot.ts    — pure, deterministic restart + notice logic (I/O-free, unit-testable), incl. parseShutdownNotice / shutdownTarget
+  canary.ts  — 可选的 canary 预重启校验：ExecStart 推导、临时补丁构建、空闲端口挑选、dump-config 预检、启动 + 存活探测（所有 IO 都可通过 CanaryHooks 注入）
 test/
-  marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / selectsAgent / targetsAgent / compiled exports
+  marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / parseCgroupUnit / selectsAgent / targetsAgent / compiled exports
   notice.test.js  — buildNotice / humanizeDowntime
+  canary.test.js  — deriveExecStartParams / buildPatchContent / pickFreePort / probeStatusHealthy / resolveExecTarget / runCanary with injected hooks
 ```
 
 - `pnpm install` — 安装依赖。
