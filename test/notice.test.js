@@ -62,6 +62,29 @@ test('buildNotice: omits reason line when reason absent', () => {
   assert.doesNotMatch(out, /reason:/)
 })
 
+test('buildNotice: renders interrupted sessions before the resume instruction', () => {
+  const out = buildNotice({
+    bootAt: '2026-08-18T12:00:00.000Z',
+    downtimeMs: 60000,
+    interrupted: ['session-worker-1', 'session-worker-2 (worker)'],
+  })
+  assert.match(out, /Interrupted sessions: session-worker-1, session-worker-2 \(worker\)\./)
+  // the interrupted list must come BEFORE the resume sentence
+  const interruptIdx = out.indexOf('Interrupted sessions:')
+  const resumeIdx = out.indexOf('If a task was in progress, resume it')
+  assert.ok(interruptIdx > -1 && resumeIdx > -1 && interruptIdx < resumeIdx)
+})
+
+test('buildNotice: omits interrupted line when none given', () => {
+  const out = buildNotice({ bootAt: '2026-08-18T12:00:00.000Z', downtimeMs: 60000 })
+  assert.doesNotMatch(out, /Interrupted sessions/)
+})
+
+test('buildNotice: omits interrupted line when the list is empty', () => {
+  const out = buildNotice({ bootAt: '2026-08-18T12:00:00.000Z', downtimeMs: 60000, interrupted: [] })
+  assert.doesNotMatch(out, /Interrupted sessions/)
+})
+
 test('humanizeDowntime: <1s', () => {
   assert.equal(humanizeDowntime(0), '<1s')
   assert.equal(humanizeDowntime(999), '<1s')

@@ -44,6 +44,7 @@ import {
   shutdownTarget,
   type BootMarker,
   type ShutdownNotice,
+  type ShutdownSession,
   type SmartRestartParams,
   type SmartRestartResult,
 } from './boot.js'
@@ -244,46 +245,52 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     // file absent or already removed; fine
   }
 
-  // --- 2c. Smart shutdown auto-detection (second-priority pin). -----------
+  // --- 2c. Smart shutdown auto-detection (second-priority pin) + ----------
+  //          interrupted-session list.
   // If NO pending notice exists (the restart was NOT triggered via the
   // smart_restart tool — e.g. a plain `systemctl restart` executed by the
   // agent, or while an agent was active), the SIGTERM/SIGINT handler persisted
-  // a shutdown-notice.json recording the last active session. Pin delivery to
-  // that session ONLY if it was active within `shutdownGraceMs` of shutdown
-  // (recent activity ⇒ the user restarted while the agent was mid-task, so
-  // auto-notify). If the session was idle well before shutdown, `shutdownTarget`
-  // returns null and we fall back to the existing `target`. The file is consumed
-  // (unlinked) so it cannot linger and pin a future boot; the marker still
-  // proves the restart.
+  // a shutdown-notice.json recording the sessions active within the grace
+  // window. Pin delivery to the last-active session ONLY if it was active within
+  // `shutdownGraceMs` of shutdown (recent activity ⇒ the user restarted while
+  // the agent was mid-task, so auto-notify). If it was idle well before
+  // shutdown, `shutdownTarget` returns null and we fall back to the existing
+  // `target`. The `sessions` list is captured for the post-restart notice so it
+  // can list EVERY session interrupted by the shutdown, not just the pin. The
+  // file is consumed (unlinked) so it cannot linger and pin a future boot; the
+  // marker still proves the restart.
   const shutdownPath = join(markerDir, 'shutdown-notice.json')
-  if (!pinnedTarget) {
-    try {
-      const notice = parseShutdownNotice(readFileSync(shutdownPath, 'utf8'))
-      const target = shutdownTarget(notice, Date.now(), config.shutdownGraceMs)
-      // Defense-in-depth: even if a stale (pre-0.3.1) shutdown-notice.json
-      // recorded a deepartments head as last-active, never pin a notice to an
-      // ignored session.
-      if (target && !ignoredByPrefix(target, config.ignoredSessionPrefixes)) {
-        pinnedTarget = target
-        pinnedReason = 'the process was stopped while this session was active'
-        console.log('[smart-restart] pinned restart notice to last-active session', pinnedTarget)
-      }
-    } catch {
-      // no readable shutdown notice -> nothing to pin
+  let interruptedSessions: ShutdownSession[] = []
+  let shutdownNotice: ShutdownNotice | null = null
+  try {
+    shutdownNotice = parseShutdownNotice(readFileSync(shutdownPath, 'utf8'))
+  } catch {
+    // no readable shutdown notice -> nothing to pin, no interrupted list
+  }
+  if (shutdownNotice?.sessions?.length) {
+    interruptedSessions = shutdownNotice.sessions.filter(
+      ({ id }) => !ignoredByPrefix(id, config.ignoredSessionPrefixes),
+    )
+    console.log(
+      '[smart-restart] interrupted sessions at shutdown:',
+      interruptedSessions.map((s) => s.id).join(', '),
+    )
+  }
+  if (!pinnedTarget && shutdownNotice) {
+    const target = shutdownTarget(shutdownNotice, Date.now(), config.shutdownGraceMs)
+    // Defense-in-depth: even if a stale (pre-0.3.1) shutdown-notice.json
+    // recorded a deepartments head as last-active, never pin a notice to an
+    // ignored session.
+    if (target && !ignoredByPrefix(target, config.ignoredSessionPrefixes)) {
+      pinnedTarget = target
+      pinnedReason = 'the process was stopped while this session was active'
+      console.log('[smart-restart] pinned restart notice to last-active session', pinnedTarget)
     }
-    try {
-      unlinkSync(shutdownPath)
-    } catch {
-      // file absent or already removed; fine
-    }
-  } else {
-    // A pending notice won priority; still consume any stale shutdown-notice
-    // so it cannot pin a later boot.
-    try {
-      unlinkSync(shutdownPath)
-    } catch {
-      // file absent or already removed; fine
-    }
+  }
+  try {
+    unlinkSync(shutdownPath)
+  } catch {
+    // file absent or already removed; fine
   }
 
   // --- 3. Delivery plumbing (all state is apply-scoped; nothing global). ---
@@ -292,23 +299,29 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   let deliveredAny = false
 
   // --- 3b. Smart shutdown activity tracking (apply-scoped). ---------------
-  // Track the last active session so that, if this process is stopped by a
-  // plain SIGTERM/SIGINT (a restart NOT triggered through the smart_restart
-  // tool, or a restart while an agent was active), the shutdown hook below can
-  // record which session to auto-notify on the next boot.
-  let lastActiveId: string | undefined
-  let lastActiveAt = 0
+  // Track the SET of sessions active (mid-turn) at any moment so that, if this
+  // process is stopped by a plain SIGTERM/SIGINT (a restart NOT triggered
+  // through the smart_restart tool, or a restart while agents were active), the
+  // shutdown hook below can record WHICH sessions to auto-notify on the next
+  // boot — instead of only the single most-recently-active one.
+  const activeSessions = new Map<string, number>() // sessionId -> lastStepAt
   const recordActivity = (agent: Agent) => {
-    // NEVER select a deepartments head session as "last active": an ignored
-    // session's activity is treated as if it never happened, so the most recent
-    // NON-ignored session remains the recorded last-active (and if only heads
-    // were active, nothing is recorded at all). This prevents a head from ever
-    // receiving a spurious post-restart notice. Configurable via
-    // `ignoredSessionPrefixes` (default `['head-']`).
-    if (ignoredByPrefix(String(agent.id), config.ignoredSessionPrefixes)) return
-    lastActiveId = String(agent.id)
-    lastActiveAt = Date.now()
+    // NEVER track a deepartments head session: an ignored session's activity is
+    // treated as if it never happened, so only NON-ignored sessions can be
+    // recorded (and if only heads were active, nothing is recorded at all).
+    // This prevents a head from ever receiving a spurious post-restart notice.
+    // Configurable via `ignoredSessionPrefixes` (default `['head-']`).
+    const sid = String(agent.id)
+    if (ignoredByPrefix(sid, config.ignoredSessionPrefixes)) return
+    activeSessions.set(sid, Date.now())
   }
+  // A turn closing NORMALLY (inbox drained, nextStep empty ⇒ the turn is about
+  // to close cleanly) means the session is no longer mid-turn. Remove it so a
+  // later shutdown does NOT list it as interrupted — avoids false positives for
+  // just-finished idle sessions. `agent/turn-stopping` fires before `turn/end`.
+  ctx.on('agent/turn-stopping', ({ agent }) => {
+    activeSessions.delete(String(agent.id))
+  })
 
   function deliver(agent: Agent): boolean {
     const sid = String(agent.id)
@@ -326,6 +339,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
       downtimeMs,
       customNotice: config.notice,
       reason: pinnedReason,
+      interrupted: interruptedSessions.map(({ id }) => describeInterrupted(id)),
     })
     const msg: UserMessage = createUserMessage({
       content: [{ type: 'text', text }],
@@ -406,6 +420,15 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
 
   const agentIsRoot = (agent: Agent): boolean =>
     ctx.agents.roots().some((r) => r.id === agent.id)
+
+  // Human label for one interrupted session in the post-restart notice. Where
+  // the session is resumed/live at boot we can tell a root (main) agent from a
+  // child (worker); a killed worker not yet resumed is listed by id alone.
+  const describeInterrupted = (id: string): string => {
+    const agent = ctx.agents.get(SessionId(id))
+    if (!agent) return id
+    return agentIsRoot(agent) ? `${id} (main)` : `${id} (worker)`
+  }
 
   // --- 4. Primary hook: wake on the startup session-start publication. ----
   ctx.on('agent/session-start', ({ agent, source }) => {
@@ -514,17 +537,28 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   const shutdownDocPath = join(markerDir, 'shutdown-notice.json')
   const writeShutdownNotice = () => {
     try {
-      // Never write a shutdown notice for an ignored session (e.g. a
-      // deepartments `head-*` root agent). Safety net on top of the
-      // filter in recordActivity, so a head can never be persisted as
-      // last-active regardless of how the state was reached.
-      if (!lastActiveId) return // nothing was active; do not write a notice
-      if (ignoredByPrefix(lastActiveId, config.ignoredSessionPrefixes)) return
+      // Sessions active within the grace window at shutdown, minus any ignored
+      // (e.g. deepartments `head-*`) session — defense in depth on top of the
+      // filter in recordActivity, so a head can never appear in the notice.
+      const now = Date.now()
+      const sessions: ShutdownSession[] = [...activeSessions.entries()]
+        .filter(([, at]) => now - at <= config.shutdownGraceMs)
+        .map(([id, at]) => ({ id, lastActiveAt: new Date(at).toISOString() }))
+        .filter(({ id }) => !ignoredByPrefix(id, config.ignoredSessionPrefixes))
+      if (sessions.length === 0) return // nothing was active; do not write a notice
+      // Keep the single-session pin behavior: derive `lastSessionId` from the
+      // entry with the MAX timestamp, so the boot-side `shutdownTarget` (which
+      // pins delivery to one session) keeps pointing at the most-recently-active
+      // session without regression.
+      const primary = sessions.reduce((a, b) =>
+        Date.parse(a.lastActiveAt) >= Date.parse(b.lastActiveAt) ? a : b,
+      )
       mkdirSync(markerDir, { recursive: true })
       const doc: ShutdownNotice = {
-        lastSessionId: lastActiveId,
-        lastActiveAt: new Date(lastActiveAt || Date.now()).toISOString(),
+        lastSessionId: primary.id,
+        lastActiveAt: primary.lastActiveAt,
         when: new Date().toISOString(),
+        sessions,
       }
       writeFileSync(shutdownDocPath, JSON.stringify(doc, null, 2))
     } catch (err) {
@@ -559,7 +593,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
       defineTool({
         name: 'smart_restart',
         description:
-          'Restart the DSH service via systemd and, after it comes back up, deliver the smart-restart notice to THIS session so the interrupted task resumes automatically.',
+          'Restart the DSH service via systemd and, after it comes back up, deliver the smart-restart notice to THIS session so the interrupted task resumes automatically. WARNING: restarting the service any other way (raw systemctl/reboot) while subagents/workers have active turns kills them mid-flight — their sessions end "Stopped" (turn reason: interrupted) and the tool result is "outcome unknown". Use this tool for any restart with live work; the canary param aborts on an unhealthy boot.',
         parameters: {
           reason: {
             type: 'string',

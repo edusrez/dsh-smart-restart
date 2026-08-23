@@ -64,6 +64,10 @@ export interface BuildNoticeOptions {
   customNotice?: string;
   /** Optional human reason recorded by the smart_restart tool caller. */
   reason?: string;
+  /** Session labels (id, or "id (type)") interrupted by the shutdown. Rendered
+   *  BEFORE the resume instruction so the agent sees exactly whose work was cut.
+   *  Ignored when a customNotice wins verbatim. */
+  interrupted?: string[];
 }
 
 /** Build the agent-facing restart notice. A customNotice wins verbatim. */
@@ -76,6 +80,9 @@ export function buildNotice(opts: BuildNoticeOptions): string {
   }
   if (opts.reason) {
     text += ` reason: ${opts.reason}.`;
+  }
+  if (opts.interrupted && opts.interrupted.length > 0) {
+    text += ` Interrupted sessions: ${opts.interrupted.join(', ')}.`;
   }
   text += ` If a task was in progress, resume it; otherwise reply with a one-line acknowledgment.`;
   return text;
@@ -162,25 +169,43 @@ export function selectsAgent(
 }
 
 /**
+ * One session that was active (mid-turn) within the shutdown grace window when
+ * the process was stopped — i.e. it was likely interrupted by the restart.
+ */
+export interface ShutdownSession {
+  /** Session id that was active at shutdown. */
+  id: string;
+  /** ISO timestamp of that session's last recorded activity. */
+  lastActiveAt: string;
+}
+
+/**
  * A durable shutdown notice persisted on SIGTERM/SIGINT by the running process
  * so the NEXT boot can detect that the process stopped while an agent session
  * was active — and auto-notify that session without requiring the smart_restart
  * tool to have been invoked.
  */
 export interface ShutdownNotice {
-  /** Session id that was last active just before the process went down. */
+  /** Session id that was last active just before the process went down. Kept
+   *  as the single-session pin (derived from the max-timestamp entry) for
+   *  backward compatibility with the existing auto-pin behavior. */
   lastSessionId: string;
   /** ISO timestamp of that last activity. */
   lastActiveAt: string;
   /** ISO timestamp of when the shutdown notice was written. */
   when: string;
+  /** Optional list of sessions that were active within the grace window at
+   *  shutdown (the interrupted-session set rendered in the post-restart notice). */
+  sessions?: ShutdownSession[];
 }
 
 /**
  * Parse a shutdown-notice JSON document written by the SIGTERM/SIGINT handler.
  * Tolerant of missing/corrupt JSON; requires a non-empty `lastSessionId` and a
- * parseable `lastActiveAt` timestamp. Returns null when the document is not a
- * usable shutdown notice.
+ * parseable `lastActiveAt` timestamp. When a `sessions` array is present, valid
+ * entries (non-empty id + parseable timestamp) are carried through; malformed
+ * entries are dropped. Returns null when the document is not a usable shutdown
+ * notice.
  */
 export function parseShutdownNotice(raw: string): ShutdownNotice | null {
   try {
@@ -192,11 +217,25 @@ export function parseShutdownNotice(raw: string): ShutdownNotice | null {
       typeof data.lastActiveAt === 'string' &&
       Number.isFinite(Date.parse(data.lastActiveAt))
     ) {
-      return {
+      const parsed: ShutdownNotice = {
         lastSessionId: data.lastSessionId,
         lastActiveAt: data.lastActiveAt,
         when: typeof data.when === 'string' ? data.when : '',
       };
+      if (Array.isArray(data.sessions)) {
+        const sessions = data.sessions
+          .filter(
+            (s): s is ShutdownSession =>
+              !!s &&
+              typeof s.id === 'string' &&
+              s.id.length > 0 &&
+              typeof s.lastActiveAt === 'string' &&
+              Number.isFinite(Date.parse(s.lastActiveAt)),
+          )
+          .map((s) => ({ id: s.id, lastActiveAt: s.lastActiveAt }));
+        if (sessions.length > 0) parsed.sessions = sessions;
+      }
+      return parsed;
     }
     return null;
   } catch {

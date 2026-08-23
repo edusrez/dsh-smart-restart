@@ -157,6 +157,69 @@ test('shutdownTarget: NaN guards return null', () => {
   assert.equal(shutdownTarget(notice, Number.NaN, 600_000), null)
 })
 
+// --- v0.6.0: interrupted-session list carried on the shutdown notice ---------
+
+test('parseShutdownNotice: parses an optional sessions list', () => {
+  const raw = JSON.stringify({
+    lastSessionId: 'session-abc',
+    lastActiveAt: '2026-08-18T11:59:30.000Z',
+    when: '2026-08-18T12:00:00.000Z',
+    sessions: [
+      { id: 'session-abc', lastActiveAt: '2026-08-18T11:59:30.000Z' },
+      { id: 'worker-1', lastActiveAt: '2026-08-18T11:59:40.000Z' },
+    ],
+  })
+  assert.deepEqual(parseShutdownNotice(raw), {
+    lastSessionId: 'session-abc',
+    lastActiveAt: '2026-08-18T11:59:30.000Z',
+    when: '2026-08-18T12:00:00.000Z',
+    sessions: [
+      { id: 'session-abc', lastActiveAt: '2026-08-18T11:59:30.000Z' },
+      { id: 'worker-1', lastActiveAt: '2026-08-18T11:59:40.000Z' },
+    ],
+  })
+})
+
+test('parseShutdownNotice: drops malformed session entries', () => {
+  const raw = JSON.stringify({
+    lastSessionId: 's1',
+    lastActiveAt: '2026-08-18T12:00:00.000Z',
+    when: '',
+    sessions: [
+      { id: '', lastActiveAt: '2026-08-18T12:00:00.000Z' },
+      { id: 'good', lastActiveAt: '2026-08-18T12:00:00.000Z' },
+      { id: 'bad-date', lastActiveAt: 'not-a-date' },
+    ],
+  })
+  assert.deepEqual(parseShutdownNotice(raw), {
+    lastSessionId: 's1',
+    lastActiveAt: '2026-08-18T12:00:00.000Z',
+    when: '',
+    sessions: [{ id: 'good', lastActiveAt: '2026-08-18T12:00:00.000Z' }],
+  })
+})
+
+test('parseShutdownNotice: no sessions key yields no sessions field', () => {
+  const raw = JSON.stringify({ lastSessionId: 's1', lastActiveAt: '2026-08-18T12:00:00.000Z' })
+  const out = parseShutdownNotice(raw)
+  assert.ok(!('sessions' in out))
+})
+
+test('shutdownTarget: ignores the sessions list and pins the single last-active', () => {
+  // The single-session pin must keep deriving from lastSessionId/lastActiveAt
+  // even when a sessions list is present (backward-compat for the pin).
+  const notice = {
+    lastSessionId: 'worker-1',
+    lastActiveAt: new Date(NOW - 30_000).toISOString(),
+    when: '',
+    sessions: [
+      { id: 'asistente', lastActiveAt: new Date(NOW - 200_000).toISOString() },
+      { id: 'worker-1', lastActiveAt: new Date(NOW - 30_000).toISOString() },
+    ],
+  }
+  assert.equal(shutdownTarget(notice, NOW, 600_000), 'worker-1')
+})
+
 // --- v0.3.1: ignored-session-prefix filter (deepartments heads) ------------
 
 // Deepartments heads are root agents with session id `head-<postId>`. They must
