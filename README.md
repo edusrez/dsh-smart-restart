@@ -8,6 +8,7 @@ English | [中文](README.zh.md)
 
 A **DeepSeek Harness (DSH) host plugin** that keeps the main agent aware of service restarts — **without the user having to prompt it**. On every boot it detects that a new process has taken over, wakes the target agent with a short "Smart-restart" notice (boot time, previous boot, downtime). New in **v0.2.0** it added the `smart_restart` tool to **restart DSH itself** and return the notice to the exact session that asked; new in **v0.3.0** it **auto-detects** when the service was stopped while an agent session was active, so even a *plain* `systemctl restart` the agent ran notifies that session at boot; new in **v0.4.0** it can **validate the launch first** with an optional canary pre-restart gate that aborts the restart when an ephemeral boot fails. New in **v0.5.0** it **auto-detects the systemd unit** from `/proc/self/cgroup`, so the tool and the canary work with zero config on systemd-managed installs.
 
+[![CI](https://github.com/edusrez/dsh-smart-restart/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/edusrez/dsh-smart-restart/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/dsh-smart-restart?style=flat-square&logo=npm)](https://www.npmjs.com/package/dsh-smart-restart)
 [![license](https://img.shields.io/npm/l/dsh-smart-restart?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/edusrez/dsh-smart-restart?style=flat-square)](https://github.com/edusrez/dsh-smart-restart)
