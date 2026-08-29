@@ -5,9 +5,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildPatchContent,
+  checkClientGraph,
+  clientBundleRegistersId,
   deriveExecStartParams,
+  extractBootGraph,
   pickFreePort,
   probeStatusHealthy,
+  registeredBundleId,
   resolveExecTarget,
   runCanary,
 } from '../lib/canary.js'
@@ -208,8 +212,231 @@ test('runCanary: passed when the fake boot becomes healthy — process group kil
     spawnBoot: () => ({ pid: 4242 }),
     probeLiveness: async () => true,
     killProcessGroup: (pid) => killed.push(pid),
+    // The healthy boot serves a client graph whose bundle registers its row
+    // id, so the (default-on) post-boot client-graph validation passes too.
+    fetchUrl: serveFixture(
+      { rev: 'r', entries: [{ id: 'gui', url: '/plugins/gui/client.js?rev=r1', rev: 'r1' }] },
+      { gui: bundleFor('gui') },
+    ),
   }
   const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41232 }, {}, hooks)
   assert.equal(r.status, 'passed')
   assert.deepEqual(killed, [4242])
+})
+
+// --- client boot-graph post-boot validation (P1 GUI lesson, 2026-08-29) ------
+//
+// Fixture: the boot HTML a healthy dsh web instance serves — the composed
+// `__DSH_BOOT__` graph injected as one head global row — and helper bundle
+// sources with the two real envelope conventions (tab indentation from tsdown
+// builds, two-space from the normalize-client-banner wrapper).
+const bootHtml = (graph) =>
+  `<!doctype html><html><head><script>globalThis["__DSH_BOOT__"] = ${JSON.stringify(graph)}</script></head><body></body></html>`
+
+const HEALTHY_GRAPH = {
+  rev: 'rev-graph',
+  entries: [
+    { id: 'dsh-deepartments', url: '/plugins/dsh-deepartments/client.js?rev=rev-a', rev: 'rev-a', inject: [], immediately: true },
+    { id: '@deepseek-ai/dsh-client-modules', url: '/plugins/@deepseek-ai/dsh-client-modules/client.js?rev=rev-b', rev: 'rev-b' },
+  ],
+}
+
+const bundleFor = (id) =>
+  `window.__ModuleLoader__.load({\n  id: "${id}",\n  factory: (require) => {\n    var module = { exports: {} };\n    return module.exports;\n  }\n});\n`
+
+const serveFixture = (graph, bundles) => async (url, _timeoutMs) => {
+  if (url.endsWith('/')) return { status: 200, body: bootHtml(graph) }
+  for (const [id, body] of Object.entries(bundles)) {
+    if (url.includes(`/plugins/${id}/client.js`)) return { status: 200, body }
+  }
+  return { status: 404, body: '' }
+}
+
+test('extractBootGraph: no __DSH_BOOT__ injection → null (a non-web boot has nothing to validate)', () => {
+  assert.equal(extractBootGraph('<!doctype html><html><body>hi</body></html>'), null)
+})
+
+test('extractBootGraph: parses the injected __DSH_BOOT__ graph (entries by row id + bundle url)', () => {
+  const graph = extractBootGraph(bootHtml(HEALTHY_GRAPH))
+  assert.equal(graph.rev, 'rev-graph')
+  assert.equal(graph.entries.length, 2)
+  assert.equal(graph.entries[0].id, 'dsh-deepartments')
+  assert.equal(graph.entries[0].url, '/plugins/dsh-deepartments/client.js?rev=rev-a')
+  assert.equal(graph.entries[1].rev, 'rev-b')
+})
+
+test('extractBootGraph: a present payload that is malformed throws (the browser could not boot either)', () => {
+  assert.throws(() => extractBootGraph('<script>globalThis["__DSH_BOOT__"] = {not:json}</script>'), /not valid JSON/)
+  assert.throws(() => extractBootGraph(bootHtml({ rev: 'x' })), /no entries array/)
+  assert.throws(() => extractBootGraph(bootHtml({ rev: 'x', entries: [{ url: '/plugins/a/client.js' }] })), /malformed/)
+})
+
+test('registeredBundleId: decodes the envelope id for both real bundle conventions and single-quoted ids', () => {
+  const tsdown = 'window.__ModuleLoader__.load({\n\tid: "@deepseek-ai/dsh-client-modules",\n\tfactory: (require) => {}\n});'
+  assert.equal(registeredBundleId(tsdown), '@deepseek-ai/dsh-client-modules')
+  assert.equal(registeredBundleId(bundleFor('dsh-deepartments')), 'dsh-deepartments')
+  assert.equal(registeredBundleId("window.__ModuleLoader__.load({ id: 'single-quoted', factory: () => ({}) });"), 'single-quoted')
+})
+
+test('registeredBundleId: undefined when there is no load call, no argument object, or no leading id member', () => {
+  assert.equal(registeredBundleId('module.exports = {}'), undefined)
+  assert.equal(registeredBundleId('window.__ModuleLoader__.load() // no argument object'), undefined)
+  assert.equal(registeredBundleId('window.__ModuleLoader__.load({ factory: (require) => ({}) });'), undefined)
+})
+
+test('clientBundleRegistersId: the loader invariant — a served bundle must register its graph row id', () => {
+  assert.equal(clientBundleRegistersId(bundleFor('dsh-deepartments'), 'dsh-deepartments'), true)
+  assert.equal(clientBundleRegistersId(bundleFor('dsh-deepartments'), 'dshd-gui'), false)
+  assert.equal(clientBundleRegistersId('// no registration here', 'dshd-gui'), false)
+})
+
+test('client-graph check: a healthy boot (every row registers its id) passes', async () => {
+  const fetchUrl = serveFixture(HEALTHY_GRAPH, {
+    'dsh-deepartments': bundleFor('dsh-deepartments'),
+    '@deepseek-ai/dsh-client-modules': bundleFor('@deepseek-ai/dsh-client-modules'),
+  })
+  const r = await checkClientGraph(41240, 5000, fetchUrl)
+  assert.equal(r.ok, true)
+  assert.equal(r.checked, 2)
+  assert.match(r.detail, /2 client row\(s\) register their graph id/)
+})
+
+test('client-graph check: P1 regression fixture — row "dshd-gui" served a bundle registering "dsh-deepartments" FAILS', async () => {
+  // The P1 shape (2026-08-29): a `dshd-gui` row with `dsh.client` whose served
+  // bundle is the deepartments bundle (envelope id "dsh-deepartments") — the
+  // row id can never be satisfied → GUI "loaded without registering".
+  const brokenGraph = {
+    rev: 'rev-broken',
+    entries: [
+      { id: 'dshd-gui', url: '/plugins/dshd-gui/client.js?rev=rev-x', rev: 'rev-x' },
+      { id: 'dsh-deepartments', url: '/plugins/dsh-deepartments/client.js?rev=rev-y', rev: 'rev-y' },
+    ],
+  }
+  const fetchUrl = serveFixture(brokenGraph, {
+    'dshd-gui': bundleFor('dsh-deepartments'),
+    'dsh-deepartments': bundleFor('dsh-deepartments'),
+  })
+  const r = await checkClientGraph(41241, 5000, fetchUrl)
+  assert.equal(r.ok, false)
+  assert.match(r.detail, /row "dshd-gui" bundle served but registers "dsh-deepartments" instead of "dshd-gui"/)
+})
+
+test('client-graph check: a graph row whose bundle is missing (HTTP 404) FAILS', async () => {
+  const graph = { rev: 'r', entries: [{ id: 'phantom', url: '/plugins/phantom/client.js?rev=r1', rev: 'r1' }] }
+  const r = await checkClientGraph(41242, 5000, serveFixture(graph, {}))
+  assert.equal(r.ok, false)
+  assert.match(r.detail, /row "phantom" bundle unavailable \(HTTP 404/)
+})
+
+test('client-graph check: a boot serving no __DSH_BOOT__ (non-web surface) passes trivially', async () => {
+  const fetchUrl = async () => ({ status: 200, body: '<!doctype html><html><body>no graph here</body></html>' })
+  const r = await checkClientGraph(41243, 5000, fetchUrl)
+  assert.equal(r.ok, true)
+  assert.match(r.detail, /no __DSH_BOOT__ client graph served/)
+})
+
+test('runCanary: FAILS on a client row the served bundle cannot satisfy (the P1 config shape)', async () => {
+  const brokenGraph = { rev: 'r', entries: [{ id: 'dshd-gui', url: '/plugins/dshd-gui/client.js?rev=r1', rev: 'r1' }] }
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41244,
+    dumpConfig: () => ({ ok: true, stderr: '' }),
+    spawnBoot: () => ({ pid: 4244 }),
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+    fetchUrl: serveFixture(brokenGraph, { 'dshd-gui': bundleFor('dsh-deepartments') }),
+  }
+  const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41244 }, {}, hooks)
+  assert.equal(r.status, 'failed')
+  assert.match(r.detail, /row "dshd-gui" bundle served but registers "dsh-deepartments"/)
+})
+
+test('runCanary: passes a healthy boot and reports the client rows checked', async () => {
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41245,
+    dumpConfig: () => ({ ok: true, stderr: '' }),
+    spawnBoot: () => ({ pid: 4245 }),
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+    fetchUrl: serveFixture(HEALTHY_GRAPH, {
+      'dsh-deepartments': bundleFor('dsh-deepartments'),
+      '@deepseek-ai/dsh-client-modules': bundleFor('@deepseek-ai/dsh-client-modules'),
+    }),
+  }
+  const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41245, canaryTimeoutMs: 2000 }, {}, hooks)
+  assert.equal(r.status, 'passed')
+  assert.match(r.detail, /client-graph: 2 client row\(s\) register their graph id/)
+})
+
+test('runCanary: one unsatisfiable row among healthy rows fails the whole canary', async () => {
+  const graph = {
+    rev: 'r',
+    entries: [
+      { id: 'good', url: '/plugins/good/client.js?rev=r1', rev: 'r1' },
+      { id: 'bad', url: '/plugins/bad/client.js?rev=r2', rev: 'r2' },
+    ],
+  }
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41249,
+    dumpConfig: () => ({ ok: true, stderr: '' }),
+    spawnBoot: () => ({ pid: 4249 }),
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+    fetchUrl: serveFixture(graph, { good: bundleFor('good'), bad: bundleFor('other') }),
+  }
+  const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41249 }, {}, hooks)
+  assert.equal(r.status, 'failed')
+  assert.match(r.detail, /1 of 2 row\(s\) unsatisfiable/)
+  assert.match(r.detail, /row "bad" bundle served but registers "other" instead of "bad"/)
+})
+
+test('runCanary: a boot without a client graph (non-web surface) still passes', async () => {
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41247,
+    dumpConfig: () => ({ ok: true, stderr: '' }),
+    spawnBoot: () => ({ pid: 4247 }),
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+    fetchUrl: async () => ({ status: 200, body: '<!doctype html><html><body>tui</body></html>' }),
+  }
+  const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41247 }, {}, hooks)
+  assert.equal(r.status, 'passed')
+  assert.match(r.detail, /no __DSH_BOOT__ client graph served/)
+})
+
+test('runCanary: a malformed __DSH_BOOT__ payload fails the canary (a page that could not boot)', async () => {
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41248,
+    dumpConfig: () => ({ ok: true, stderr: '' }),
+    spawnBoot: () => ({ pid: 4248 }),
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+    fetchUrl: async () => ({ status: 200, body: '<script>globalThis["__DSH_BOOT__"] = {rev: "x"}</script>' }),
+  }
+  const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41248 }, {}, hooks)
+  assert.equal(r.status, 'failed')
+  assert.match(r.detail, /not valid JSON/)
+})
+
+test('runCanary: canaryClientCheck: false skips the client-graph phase entirely (no fetches)', async () => {
+  let fetched = 0
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41246,
+    dumpConfig: () => ({ ok: true, stderr: '' }),
+    spawnBoot: () => ({ pid: 4246 }),
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+    fetchUrl: async () => {
+      fetched += 1
+      throw new Error('must not fetch with canaryClientCheck: false')
+    },
+  }
+  const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41246, canaryClientCheck: false }, {}, hooks)
+  assert.equal(r.status, 'passed')
+  assert.equal(fetched, 0)
 })

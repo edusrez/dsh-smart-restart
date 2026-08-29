@@ -7,10 +7,13 @@
  * ExecStart`), on an auto-picked free port, under a temp state overlay
  * (`dsh --patch` applied after the profile layer: this plugin disabled and
  * the listed rows' stateDir redirected into the temp dir), then probes HTTP
- * liveness on that port. `passed` lets the restart proceed; `failed` aborts
- * it (the caller alerts the calling session from the execute closure);
- * `skipped` (cannot derive binary/profile) NEVER blocks a restart, so generic
- * installs stay safe.
+ * liveness on that port and — default ON — validates the CLIENT boot graph:
+ * it parses `__DSH_BOOT__` from the served page and proves every graph row's
+ * `/plugins/<id>/client.js` bundle registers that row's id (the loader
+ * invariant a "loaded without registering" GUI break violates). `passed`
+ * lets the restart proceed; `failed` aborts it (the caller alerts the
+ * calling session from the execute closure); `skipped` (cannot derive
+ * binary/profile) NEVER blocks a restart, so generic installs stay safe.
  *
  * The module is intentionally IO-thin: the pure helpers below are exported
  * for unit tests, and every spawn/fetch/systemctl call is routed through the
@@ -39,6 +42,10 @@ export interface CanaryConfig {
   canaryProfile: string
   canaryBinary: string
   canaryStateDirOverrides: Record<string, string>
+  /** false → skip the post-boot client-graph validation (default true). */
+  canaryClientCheck?: boolean
+  /** Whole-phase budget (ms) for the client-graph validation (default 15000). */
+  canaryClientTimeoutMs?: number
 }
 
 /** smart_restart call fields the canary honors. */
@@ -64,6 +71,8 @@ export interface CanaryHooks {
   spawnBoot?: (binary: string, profile: string, patchPath: string, port: number) => ChildProcess | null
   /** Poll HTTP liveness on the port until healthy or the timeout elapses. */
   probeLiveness?: (port: number, timeoutMs: number) => Promise<boolean>
+  /** Fetch one HTTP resource (boot page + each client bundle); null on a network-layer failure. */
+  fetchUrl?: (url: string, timeoutMs: number) => Promise<{ status: number; body: string } | null>
   /** Kill the ephemeral's process group (negative pid). */
   killProcessGroup?: (pid: number) => void
 }
@@ -210,6 +219,185 @@ export function probeStatusHealthy(status: number | undefined): boolean {
   return status === 200
 }
 
+// --- client boot-graph validation (the P1 GUI lesson, 2026-08-29) ------------
+//
+// The web runtime keys every client-graph row by the LOADER ENTRY name (the
+// row id == package name) and a bundle must register EXACTLY that id via
+// `window.__ModuleLoader__.load({ id, factory })` — a loaded bundle that does
+// not register the row id fails the client boot with "loaded without
+// registering" → the "Failed to load plugins" GUI. The HTTP 200 liveness probe
+// alone never saw this (the P1 regression passed the canary), so after a
+// healthy boot the canary now parses `__DSH_BOOT__` out of the served page
+// and proves every row satisfiable: `/plugins/<id>/client.js` must be served
+// AND register the row id.
+
+/** One row of the composed client boot graph served as `window.__DSH_BOOT__`. */
+export interface ClientGraphRow {
+  /** Entry name == package name; the id every client bundle must register. */
+  id: string
+  /** Bundle endpoint, '/plugins/<id>/client.js?rev=<rev>' (graph-relative). */
+  url: string
+  /** Bundle content hash (informational here). */
+  rev?: string
+}
+
+export interface ClientGraphCheckResult {
+  ok: boolean
+  detail: string
+  /** Number of rows whose bundle registered their graph id (when ok). */
+  checked?: number
+}
+
+/** Default whole-phase budget for the client-graph validation. */
+export const DEFAULT_CLIENT_CHECK_TIMEOUT_MS = 15_000
+/** Cap on failure notes embedded in one check detail (keep alert text tight). */
+const MAX_FAILURE_NOTES = 3
+
+/**
+ * Parse the `__DSH_BOOT__` client graph out of a served boot HTML document.
+ *
+ * The web server injects the composed graph as one head global row
+ * (`<script>globalThis["__DSH_BOOT__"] = {...}</script>`), with `<` escaped
+ * as `\u003c` inside the JSON so the payload can never contain a literal
+ * `</script>`. Returns null when the document carries NO boot graph (a
+ * non-web boot — nothing to validate). A PRESENT payload that is not a valid
+ * `{rev, entries[]}` graph THROWS: a page the browser could not boot is a
+ * canary failure, not a skip.
+ */
+export function extractBootGraph(html: string): { rev: string; entries: ClientGraphRow[] } | null {
+  const m = html.match(/globalThis\["__DSH_BOOT__"\]\s*=\s*(\{[\s\S]*?\})<\/script>/)
+  if (!m) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(m[1])
+  } catch (err) {
+    throw new Error(`client-graph: __DSH_BOOT__ payload is not valid JSON: ${String(err)}`)
+  }
+  if (parsed === null || typeof parsed !== 'object' || !Array.isArray((parsed as { entries?: unknown }).entries)) {
+    throw new Error('client-graph: __DSH_BOOT__ payload has no entries array')
+  }
+  const entries = (parsed as { entries: unknown[] }).entries.map((row, i) => {
+    if (row === null || typeof row !== 'object' || typeof (row as { id?: unknown }).id !== 'string' || typeof (row as { url?: unknown }).url !== 'string') {
+      throw new Error(`client-graph: __DSH_BOOT__ entry ${i} is malformed (string id and url expected)`)
+    }
+    const r = row as { id: string; url: string; rev?: unknown }
+    return { id: r.id, url: r.url, rev: typeof r.rev === 'string' ? r.rev : undefined }
+  })
+  const rev = (parsed as { rev?: unknown }).rev
+  return { rev: typeof rev === 'string' ? rev : '', entries }
+}
+
+/**
+ * Read the id a client bundle REGISTERS: the id of the first
+ * `__ModuleLoader__.load({ id: "<id>", factory: ... })` envelope.
+ *
+ * The server-side canary can only see the served SOURCE, so it decodes the
+ * envelope. Every real DSH envelope (tsdown bundles and the
+ * normalize-client-banner wrapper) declares `id` as the FIRST member of the
+ * load() argument, so the check parses ONLY that leading `id: "..."`
+ * property — it never scans the factory body, which legitimately contains
+ * braces, regex literals and template expressions a balanced scan could not
+ * skip cheaply. A bundle whose envelope does not open with `id` (or has no
+ * envelope at all) yields undefined → the row fails as unsatisfiable, the
+ * safe direction for a restart gate.
+ */
+export function registeredBundleId(source: string): string | undefined {
+  const marker = '__ModuleLoader__.load('
+  const callIdx = source.indexOf(marker)
+  if (callIdx === -1) return undefined
+  const open = source.indexOf('{', callIdx + marker.length)
+  if (open === -1) return undefined
+  const rest = source.slice(open + 1)
+  const m = rest.match(/^\s*id\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/)
+  if (!m) return undefined
+  return unquoteJsString(m[1])
+}
+
+function unquoteJsString(raw: string): string {
+  const quote = raw.charAt(0)
+  const inner = raw.slice(1, -1)
+  // Registered ids are npm package names — they never contain escapes. Still
+  // collapse an escaped quote/backslash as a courtesy; anything else keeps its
+  // backslash so a mis-decode fails the later equality check loudly.
+  return quote === '`' ? inner.replace(/\\([`\\])/g, '$1') : inner.replace(/\\(["'\\])/g, '$1')
+}
+
+/**
+ * True when a served bundle REGISTERS the graph row's id — the loader
+ * invariant every `/plugins/<id>/client.js` must satisfy.
+ */
+export function clientBundleRegistersId(bundleSource: string, rowId: string): boolean {
+  return registeredBundleId(bundleSource) === rowId
+}
+
+/**
+ * Post-boot client-graph validation: parse `__DSH_BOOT__` from the served
+ * page and prove EVERY row satisfiable — the row's `/plugins/<id>/client.js`
+ * must be served (HTTP 200) AND register the row id. A missing page, a
+ * malformed graph, an unavailable (404) bundle, or a bundle registering
+ * NO/another id fails the check: a boot whose GUI would hit "loaded without
+ * registering" (or a 404 on fetch) must never restart past the canary.
+ *
+ * A boot that serves NO boot graph (non-web surface) passes — there are no
+ * client rows to validate. Bounded by `timeoutMs` (whole phase; each fetch is
+ * capped at 3s of the remaining budget). Runs with an injectable `fetchUrl`
+ * so tests serve fixture HTML/bundles without a real dsh instance.
+ */
+export async function checkClientGraph(
+  port: number,
+  timeoutMs: number,
+  fetchUrl: (url: string, timeoutMs: number) => Promise<{ status: number; body: string } | null>,
+): Promise<ClientGraphCheckResult> {
+  const origin = `http://127.0.0.1:${port}`
+  const deadline = Date.now() + timeoutMs
+  const remaining = (): number => deadline - Date.now()
+  if (remaining() <= 0) {
+    return { ok: false, detail: 'client-graph: phase timeout exceeded before the first fetch' }
+  }
+  const page = await fetchUrl(`${origin}/`, Math.min(3000, remaining()))
+  if (!page) {
+    return { ok: false, detail: 'client-graph: boot HTML unavailable (ephemeral instance unreachable after liveness)' }
+  }
+  if (page.status !== 200) {
+    return { ok: false, detail: `client-graph: boot HTML returned HTTP ${page.status}` }
+  }
+  let graph: { rev: string; entries: ClientGraphRow[] } | null = null
+  try {
+    graph = extractBootGraph(page.body)
+  } catch (err) {
+    return { ok: false, detail: String(err) }
+  }
+  if (!graph) {
+    return { ok: true, detail: 'client-graph: no __DSH_BOOT__ client graph served — nothing to validate' }
+  }
+  const failures: string[] = []
+  let checked = 0
+  for (const row of graph.entries) {
+    const left = remaining()
+    if (left <= 0) {
+      return { ok: false, detail: `client-graph: timed out before validating all ${graph.entries.length} row(s)` }
+    }
+    const url = new URL(row.url, origin).href
+    const res = await fetchUrl(url, Math.min(3000, left))
+    if (!res) {
+      failures.push(`row "${row.id}" bundle fetch failed at ${url}`)
+    } else if (res.status !== 200) {
+      failures.push(`row "${row.id}" bundle unavailable (HTTP ${res.status} at ${url})`)
+    } else if (!clientBundleRegistersId(res.body, row.id)) {
+      const got = registeredBundleId(res.body)
+      failures.push(`row "${row.id}" bundle served but ${got === undefined ? 'registers no id' : `registers "${got}" instead of "${row.id}"`}`)
+    } else {
+      checked += 1
+    }
+  }
+  if (failures.length > 0) {
+    const notes = failures.slice(0, MAX_FAILURE_NOTES).join('; ')
+    const more = failures.length > MAX_FAILURE_NOTES ? ` (and ${failures.length - MAX_FAILURE_NOTES} more)` : ''
+    return { ok: false, detail: `client-graph: ${failures.length} of ${graph.entries.length} row(s) unsatisfiable — ${notes}${more}` }
+  }
+  return { ok: true, detail: `client-graph: ${checked} client row(s) register their graph id`, checked }
+}
+
 // --- default IO implementations (swapped by tests via CanaryHooks) ---------
 
 function execStartOfUnitDefault(unit: string): string | null {
@@ -274,6 +462,16 @@ async function probeLivenessDefault(port: number, timeoutMs: number): Promise<bo
   }
 }
 
+async function fetchUrlDefault(url: string, timeoutMs: number): Promise<{ status: number; body: string } | null> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+    const body = await res.text()
+    return { status: res.status, body }
+  } catch {
+    return null // refused / aborted / body read failed
+  }
+}
+
 function killProcessGroupDefault(pid: number): void {
   try {
     process.kill(-pid, 'SIGTERM')
@@ -288,6 +486,7 @@ export const defaultCanaryHooks: CanaryHooks = {
   dumpConfig: dumpConfigDefault,
   spawnBoot: spawnBootDefault,
   probeLiveness: probeLivenessDefault,
+  fetchUrl: fetchUrlDefault,
   killProcessGroup: killProcessGroupDefault,
 }
 
@@ -300,10 +499,11 @@ export const defaultCanaryHooks: CanaryHooks = {
  * here: a failed canary is alerted by the caller (execute closure), which
  * owns ctx access.
  *
- * Returns `passed` (boot healthy → restart may proceed), `failed` (abort the
- * restart), or `skipped` (canary not enabled, or binary/profile cannot be
- * derived — never blocks a restart). The temp dir is always removed and the
- * ephemeral process group always killed before returning.
+ * Returns `passed` (boot healthy AND, when enabled, every client-graph row
+ * satisfiable → restart may proceed), `failed` (abort the restart), or
+ * `skipped` (canary not enabled, or binary/profile cannot be derived — never
+ * blocks a restart). The temp dir is always removed and the ephemeral process
+ * group always killed before returning.
  */
 export async function runCanary(
   ctx: unknown,
@@ -354,6 +554,48 @@ export async function runCanary(
     }
 
     const healthy = await (hooks.probeLiveness ?? probeLivenessDefault)(port, cfg.canaryTimeoutMs)
+    if (!healthy) {
+      // Always stop the ephemeral instance before returning.
+      if (spawned.pid !== undefined) {
+        try {
+          stop(spawned.pid)
+        } catch {
+          // process group already gone; ignore
+        }
+      }
+      spawned = null
+      return {
+        status: 'failed',
+        detail: `canary boot did not become healthy within ${cfg.canaryTimeoutMs}ms`,
+      }
+    }
+
+    // ── Post-boot client-graph validation (default ON, keeps the ephemeral
+    //    alive until it finishes). The HTTP 200 probe alone let the P1 GUI
+    //    regression — a client row whose served bundle never registers its
+    //    graph id — pass the canary; re-validate the client boot graph now
+    //    that the instance is up, exactly as the browser would consume it.
+    let detail = `canary boot healthy on 127.0.0.1:${port}`
+    if (cfg.canaryClientCheck === undefined || cfg.canaryClientCheck) {
+      const graphCheck = await checkClientGraph(
+        port,
+        cfg.canaryClientTimeoutMs ?? DEFAULT_CLIENT_CHECK_TIMEOUT_MS,
+        hooks.fetchUrl ?? fetchUrlDefault,
+      )
+      if (!graphCheck.ok) {
+        // Always stop the ephemeral instance before returning.
+        if (spawned.pid !== undefined) {
+          try {
+            stop(spawned.pid)
+          } catch {
+            // process group already gone; ignore
+          }
+        }
+        spawned = null
+        return { status: 'failed', detail: graphCheck.detail }
+      }
+      detail = `${detail}; ${graphCheck.detail}`
+    }
     // Always stop the ephemeral instance before returning.
     if (spawned.pid !== undefined) {
       try {
@@ -363,14 +605,7 @@ export async function runCanary(
       }
     }
     spawned = null
-
-    if (!healthy) {
-      return {
-        status: 'failed',
-        detail: `canary boot did not become healthy within ${cfg.canaryTimeoutMs}ms`,
-      }
-    }
-    return { status: 'passed', detail: `canary boot healthy on 127.0.0.1:${port}` }
+    return { status: 'passed', detail }
   } catch (err) {
     return { status: 'failed', detail: `canary error: ${String(err)}` }
   } finally {

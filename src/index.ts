@@ -105,6 +105,16 @@ export interface Config {
    *  Relative or empty values resolve under the canary temp dir; absolute
    *  values are used verbatim. */
   canaryStateDirOverrides: Record<string, string>
+  /** Post-boot client-graph validation for the canary (default true): after
+   *  the HTTP liveness probe, the canary parses `__DSH_BOOT__` from the
+   *  served page and verifies every client-graph row's
+   *  `/plugins/<id>/client.js` bundle registers that row's id — the loader
+   *  invariant a "loaded without registering" GUI break violates. A boot
+   *  that serves no `__DSH_BOOT__` (non-web surface) passes trivially. */
+  canaryClientCheck: boolean
+  /** Whole-phase budget (ms) for the canary's client-graph validation
+   *  (default 15000). */
+  canaryClientTimeoutMs: number
 }
 
 const DEFAULTS: Config = {
@@ -125,6 +135,9 @@ const DEFAULTS: Config = {
   canaryProfile: '',
   canaryBinary: '',
   canaryStateDirOverrides: {},
+  // Client-graph post-boot validation is ON by default once the canary runs.
+  canaryClientCheck: true,
+  canaryClientTimeoutMs: 15_000,
 }
 
 /** Fallback poll interval while waiting for a pinned session to resume. */
@@ -603,7 +616,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           canary: {
             type: 'boolean',
             description:
-              'Optional: validate the restart with a canary pre-flight first — boots an ephemeral DSH instance (same binary/profile as this unit) on a temp free port with a temp state overlay, probes HTTP health, and aborts the restart on failure. Overrides the configured `canary` for this call.',
+              'Optional: validate the restart with a canary pre-flight first — boots an ephemeral DSH instance (same binary/profile as this unit) on a temp free port with a temp state overlay, probes HTTP health plus the client boot graph (every /plugins/<id>/client.js must register its graph row id), and aborts the restart on failure. Overrides the configured `canary` for this call.',
           },
         },
         output: {
