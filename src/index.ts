@@ -149,7 +149,25 @@ const PENDING_POLL_MAX_MS = 15000
 const UNIT_TOKEN_RE = /^[A-Za-z0-9_.@-]+$/
 
 export const name = 'smart-restart'
-export const inject = ['agents', 'tools']
+export const inject = ['agents', 'sessions', 'tools']
+
+/**
+ * Whether a signal handler may re-raise its signal after running: true only
+ * when THIS handler is the last one registered for that signal (bare Node:
+ * dev/CLI runs), so the re-raise triggers Node's default termination action
+ * (exit 143 SIGTERM / 130 SIGINT). With ANY other listener present (real
+ * host: the core bootstrap's SIGTERM/SIGINT handler), the plugin steps aside
+ * and lets the other listener complete the graceful shutdown
+ * (fiber.dispose() → write-behind flush-all, 5s budget) — re-raising there
+ * would hit the bootstrap's interrupt() with a dispose already pending and
+ * force-exit mid-flush (RD #483). The count is taken BEFORE this handler
+ * removes itself, so `<= 1` means "no other listener". Exported so the
+ * signal regression tests (test/signal.test.js) exercise the real decision
+ * against the live process listener table.
+ */
+export function shouldReRaiseSignal(signal: NodeJS.Signals): boolean {
+  return process.listenerCount(signal) <= 1
+}
 
 const moduleRequire = createRequire(import.meta.url)
 
@@ -583,18 +601,29 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   // termination action. If the handler only writes and returns, a `systemctl
   // restart`/`stop` would leave the process alive until systemd's
   // TimeoutStopSec escalates to SIGKILL (default 90s), breaking restarts of
-  // this very service. So after writing the notice we remove ourselves and
-  // re-raise the signal, letting Node's default action terminate cleanly with
-  // exit code 143 (SIGTERM) / 130 (SIGINT) — discovered via an isolated smoke.
+  // this very service. So after writing the notice we re-raise the signal —
+  // but ONLY when this handler is the last one registered (bare Node: dev,
+  // unit tests), letting Node's default action terminate cleanly with exit
+  // code 143 (SIGTERM) / 130 (SIGINT) — discovered via an isolated smoke.
+  // When the core bootstrap's own SIGTERM/SIGINT handler is present (real
+  // host), we do NOT re-raise: the re-raised signal would hit the
+  // bootstrap's interrupt() with a dispose already pending and force-exit
+  // immediately (profile-boot forceExitOnce), cutting the graceful
+  // fiber.dispose() → write-behind flush-all mid-flight (RD #483).
   const onSigterm = () => {
     writeShutdownNotice()
-    process.removeListener('SIGTERM', onSigterm)
-    process.kill(process.pid, 'SIGTERM')
+    // Count BEFORE removing ourselves: `<= 1` then means "no other listener".
+    if (shouldReRaiseSignal('SIGTERM')) {
+      process.removeListener('SIGTERM', onSigterm)
+      process.kill(process.pid, 'SIGTERM')
+    }
   }
   const onSigint = () => {
     writeShutdownNotice()
-    process.removeListener('SIGINT', onSigint)
-    process.kill(process.pid, 'SIGINT')
+    if (shouldReRaiseSignal('SIGINT')) {
+      process.removeListener('SIGINT', onSigint)
+      process.kill(process.pid, 'SIGINT')
+    }
   }
   process.on('SIGTERM', onSigterm)
   process.on('SIGINT', onSigint)
@@ -663,6 +692,23 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
         async execute(args, exec): Promise<SmartRestartOutcome> {
           const guard = guardRestart(effectiveRestartUnit, exec)
           if (!guard.ok) return guard.result
+          // RD #483 (b): durable checkpoint of the CALLING session before the
+          // fire-and-forget spawn. The core's checkpoint policy already flushes
+          // the session BEFORE the tool body (dsh-session-checkpoint-policy
+          // tools/execute hook — ctx.sessions.flush(exec.agent.session)); this
+          // explicit drain additionally settles anything that raced in during
+          // the guards/canary window, so the spawn never outruns the calling
+          // session's write-behind batch. Best-effort by design: a flush
+          // failure must NOT block the restart — the core's graceful SIGTERM
+          // dispose (un-sabotaged by fix (a)) remains the durability backstop.
+          const callingSession = ctx.sessions.get(SessionId(guard.sessionId))
+          if (callingSession !== undefined) {
+            try {
+              await ctx.sessions.flush(callingSession)
+            } catch (err) {
+              console.warn('[smart-restart] smart_restart: calling-session flush failed:', err)
+            }
+          }
           // --- Optional canary gate (runs after the guards, BEFORE the
           //      pending-notice persist and BEFORE any spawn). ---------------
           // A failed canary aborts the restart: no pending notice is written,
