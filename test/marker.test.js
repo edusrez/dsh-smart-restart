@@ -2,7 +2,7 @@
 // integration check against the compiled plugin (lib/index.js).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { detectRestart, ignoredByPrefix, parseCgroupUnit, parsePendingNotice, parseShutdownNotice, selectsAgent, shutdownTarget, targetsAgent } from '../lib/boot.js'
+import { activeAgentGuard, detectRestart, ignoredByPrefix, interruptedHeads, parseCgroupUnit, parsePendingNotice, parseShutdownNotice, selectsAgent, shutdownTarget, targetsAgent } from '../lib/boot.js'
 
 const NOW = Date.parse('2026-08-18T12:00:00.000Z')
 const PREV = Date.parse('2026-08-18T11:59:00.000Z') // 60_000 ms before NOW
@@ -300,4 +300,94 @@ test('compiled plugin exports name and a function apply', async () => {
   const mod = await import('../lib/index.js')
   assert.equal(mod.name, 'smart-restart')
   assert.equal(typeof mod.apply, 'function')
+})
+
+// --- fb-168: read-before-edit guard (activeAgentGuard) + -------------------
+//            interrupted-head resume recipients (interruptedHeads)
+//
+// fb-168 (2026-09-05 incident): smart_restart ran with a STALE agent check and
+// cut 1 IPH + 1 QH + 3 builders mid-turn. The fix: the tool reads the LIVE
+// agent registry (status === 'running') and refuses to restart while OTHER
+// sessions are mid-turn, unless an explicit force override is passed; and the
+// boot auto-notifies the interrupted HEADS so the org never hangs post-restart.
+
+const CALLER = 'asistente'
+
+test('activeAgentGuard: blocks when OTHER sessions are mid-turn (status running)', () => {
+  // fb-168 reproduction shape: a head and a worker mid-turn while the caller asks.
+  const agents = [
+    { id: 'head-internal-programming-head', status: 'running' },
+    { id: 'worker-builder-9', status: 'running' },
+    { id: CALLER, status: 'running' }, // the caller itself is running — excluded
+  ]
+  assert.deepEqual(activeAgentGuard(agents, CALLER, false), {
+    allowed: false,
+    inFlight: ['head-internal-programming-head', 'worker-builder-9'],
+  })
+})
+
+test('activeAgentGuard: the calling session is always excluded from the in-flight list', () => {
+  const agents = [
+    { id: CALLER, status: 'running' },
+    { id: 'other-idle', status: 'idle' },
+  ]
+  assert.deepEqual(activeAgentGuard(agents, CALLER, false), { allowed: true, inFlight: [] })
+})
+
+test('activeAgentGuard: passes with 0 other sessions running (normal restart)', () => {
+  assert.deepEqual(activeAgentGuard([], CALLER, false), { allowed: true, inFlight: [] })
+  const agents = [
+    { id: CALLER, status: 'running' },
+    { id: 'head-x', status: 'idle' },
+    { id: 'worker-y', status: 'idle' },
+  ]
+  assert.deepEqual(activeAgentGuard(agents, CALLER, false), { allowed: true, inFlight: [] })
+})
+
+test('activeAgentGuard: non-running statuses are never counted (only status running)', () => {
+  const agents = [
+    { id: 'a', status: 'idle' },
+    { id: 'b', status: 'suspended' }, // unknown status — not 'running'
+  ]
+  assert.deepEqual(activeAgentGuard(agents, CALLER, false), { allowed: true, inFlight: [] })
+})
+
+test('activeAgentGuard: explicit force:true overrides the block and keeps the in-flight list', () => {
+  // The override is the ONLY way through — and the caller always logs the list.
+  const agents = [
+    { id: 'head-quality-head', status: 'running' },
+    { id: CALLER, status: 'running' },
+  ]
+  assert.deepEqual(activeAgentGuard(agents, CALLER, true), {
+    allowed: true,
+    inFlight: ['head-quality-head'],
+  })
+})
+
+test('activeAgentGuard: force with nothing in flight is trivially allowed', () => {
+  assert.deepEqual(activeAgentGuard([], CALLER, true), { allowed: true, inFlight: [] })
+})
+
+test('interruptedHeads: selects the ignored-prefix (head) sessions of the interrupted list', () => {
+  // fb-168 (b): the interrupted heads are the automatic resume recipients.
+  const sessions = [
+    { id: 'head-research-head', lastActiveAt: '2026-09-05T10:00:00.000Z' },
+    { id: 'worker-builder-9', lastActiveAt: '2026-09-05T10:00:01.000Z' },
+    { id: 'head-quality-head', lastActiveAt: '2026-09-05T10:00:02.000Z' },
+  ]
+  assert.deepEqual(interruptedHeads(sessions, ['head-']), ['head-research-head', 'head-quality-head'])
+})
+
+test('interruptedHeads: no sessions / empty list yields no recipients', () => {
+  assert.deepEqual(interruptedHeads(undefined, ['head-']), [])
+  assert.deepEqual(interruptedHeads([], ['head-']), [])
+})
+
+test('interruptedHeads: respects custom prefix sets', () => {
+  const sessions = [
+    { id: 'head-x', lastActiveAt: '2026-09-05T10:00:00.000Z' },
+    { id: 'bot-assistant', lastActiveAt: '2026-09-05T10:00:01.000Z' },
+  ]
+  assert.deepEqual(interruptedHeads(sessions, ['bot-']), ['bot-assistant'])
+  assert.deepEqual(interruptedHeads(sessions, ['head-']), ['head-x'])
 })

@@ -195,7 +195,9 @@ export interface ShutdownNotice {
   /** ISO timestamp of when the shutdown notice was written. */
   when: string;
   /** Optional list of sessions that were active within the grace window at
-   *  shutdown (the interrupted-session set rendered in the post-restart notice). */
+   *  shutdown — the FULL interrupted set (heads included since fb-168), used
+   *  both for the "Interrupted sessions:" render of the main notice and as the
+   *  source of the interrupted-HEAD resume recipients (`interruptedHeads`). */
   sessions?: ShutdownSession[];
 }
 
@@ -323,4 +325,68 @@ export function shutdownTarget(
   if (!Number.isFinite(lastActiveAtMs) || !Number.isFinite(shutdownAtMs)) return null;
   if (shutdownAtMs - lastActiveAtMs <= graceMs) return notice.lastSessionId;
   return null;
+}
+
+/** One live agent as the read-before-edit guard sees it (duck-typed from the
+ *  harness Agent handle: `status` is the lifecycle state, `'running'` while a
+ *  driver is actively draining/checkpointing a turn, `'idle'` otherwise). */
+export interface ActiveAgentView {
+  id: unknown
+  status: string
+}
+
+export interface ActiveAgentGuardResult {
+  /** true → the restart may proceed (no OTHER session mid-turn, or an explicit
+   *  `force` override was passed). */
+  allowed: boolean
+  /** Sessions mid-turn at check time, EXCLUDING the calling session — the
+   *  caller restarts itself intentionally and is pinned for resume, so it is
+   *  never counted as an interruption victim. Empty when none in flight. */
+  inFlight: string[]
+}
+
+/**
+ * fb-168 (a) — the read-before-edit guard for the smart_restart tool.
+ *
+ * Decides whether a restart may proceed based on the LIVE agent registry of
+ * the DSH process: a session with `status === 'running'` has an active turn in
+ * flight that a restart would cut. The guard BLOCKS (returns `allowed: false`
+ * with the in-flight list) when ANY session other than the calling session is
+ * running and no explicit `force` override was passed — a blind interruption
+ * becomes structurally impossible. The caller always logs the outcome (and the
+ * in-flight list), so an exercised `force` override is always visible.
+ *
+ * Pure & IO-free: the live registry snapshot is passed in, so unit tests run
+ * without a harness.
+ */
+export function activeAgentGuard(
+  agents: readonly ActiveAgentView[],
+  callingSessionId: string,
+  force: boolean,
+): ActiveAgentGuardResult {
+  const inFlight = agents
+    .filter((a) => a.status === 'running' && String(a.id) !== callingSessionId)
+    .map((a) => String(a.id))
+  return { allowed: inFlight.length === 0 || force, inFlight }
+}
+
+/**
+ * fb-168 (b) — the automatic resume-notify recipients of a shutdown notice.
+ *
+ * The sessions of the interrupted list that match the ignored prefixes
+ * (deepartments department HEADS by default, `head-`): their turns were cut by
+ * the restart, and the boot must notify each of them so the organization never
+ * hangs idle post-restart without knowing (fb-46). Non-ignored interrupted
+ * sessions (workers) are NOT recipients — they surface in the main notice's
+ * "Interrupted sessions:" list, and the notified heads are exactly who
+ * re-deploys them.
+ */
+export function interruptedHeads(
+  sessions: readonly ShutdownSession[] | undefined,
+  prefixes: readonly string[],
+): string[] {
+  if (!sessions) return []
+  return sessions
+    .filter(({ id }) => ignoredByPrefix(id, prefixes))
+    .map(({ id }) => id)
 }

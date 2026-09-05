@@ -34,9 +34,11 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+  activeAgentGuard,
   buildNotice,
   detectRestart,
   ignoredByPrefix,
+  interruptedHeads,
   parseCgroupUnit,
   parsePendingNotice,
   parseShutdownNotice,
@@ -58,6 +60,10 @@ import { runCanary, type CanaryResult } from './canary.js'
 export interface SmartRestartCall extends SmartRestartParams {
   /** Run the canary pre-restart validation for THIS call; overrides config.canary. */
   canary?: boolean
+  /** Explicit override of the read-before-edit guard (fb-168): restart even
+   *  when OTHER sessions are mid-turn. Without it the tool refuses and returns
+   *  the in-flight session list; the override is ALWAYS visible in the log. */
+  force?: boolean
 }
 
 /** smart_restart result extended with the canary outcome. */
@@ -66,6 +72,9 @@ export interface SmartRestartOutcome extends SmartRestartResult {
   canary?: 'skipped' | 'passed' | 'failed'
   /** Human detail for a skipped/failed canary outcome. */
   canaryDetail?: string
+  /** Other sessions that were mid-turn when a guard-blocked restart was
+   *  refused (absent when the restart proceeded / nothing was in flight). */
+  inFlight?: string[]
 }
 
 export interface Config {
@@ -79,11 +88,14 @@ export interface Config {
   /** Grace window (ms) before shutdown within which last agent activity counts
    *  as "agent-involved" for the smart shutdown auto-notification. */
   shutdownGraceMs: number
-  /** Session id prefixes that must NEVER be selected as "last active" for the
-   *  smart-shutdown auto-notification. Deepartments department heads are
-   *  first-class root agents with ids `head-<postId>`, and a head must never
-   *  receive a spurious post-restart notice, so `head-` is ignored by default.
-   *  Configure this to add/remove patterns. */
+  /** Session id prefixes that must NEVER be selected as the single-session
+   *  "last active" PIN for the smart-shutdown auto-notification. Deepartments
+   *  department heads are first-class root agents with ids `head-<postId>`,
+   *  and a head must never receive a spurious pinned notice (the 0.3.1
+   *  regression), so `head-` is ignored by default. Since fb-168 the SAME
+   *  prefixes identify the interrupted-HEAD resume recipients: a head whose
+   *  turn was genuinely cut by the restart still receives its own resume
+   *  notice at boot (never a pin). Configure this to add/remove patterns. */
   ignoredSessionPrefixes: string[]
   /** Opt-in canary pre-restart validation: boot an ephemeral DSH instance and
    *  abort the restart when it fails (see src/canary.ts). The per-call
@@ -277,7 +289,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   }
 
   // --- 2c. Smart shutdown auto-detection (second-priority pin) + ----------
-  //          interrupted-session list.
+  //          interrupted-session list + interrupted-head resume recipients.
   // If NO pending notice exists (the restart was NOT triggered via the
   // smart_restart tool — e.g. a plain `systemctl restart` executed by the
   // agent, or while an agent was active), the SIGTERM/SIGINT handler persisted
@@ -286,12 +298,16 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   // `shutdownGraceMs` of shutdown (recent activity ⇒ the user restarted while
   // the agent was mid-task, so auto-notify). If it was idle well before
   // shutdown, `shutdownTarget` returns null and we fall back to the existing
-  // `target`. The `sessions` list is captured for the post-restart notice so it
-  // can list EVERY session interrupted by the shutdown, not just the pin. The
-  // file is consumed (unlinked) so it cannot linger and pin a future boot; the
-  // marker still proves the restart.
+  // `target`. The `sessions` list — the FULL interrupted set, heads included
+  // (fb-168) — is captured so the post-restart notice can list EVERY session
+  // interrupted by the shutdown, and so the interrupted HEADS can each receive
+  // an automatic resume notice when they come live (fb-46: the organization
+  // must never hang idle post-restart without knowing). The file is consumed
+  // (unlinked) so it cannot linger and pin a future boot; the marker still
+  // proves the restart.
   const shutdownPath = join(markerDir, 'shutdown-notice.json')
   let interruptedSessions: ShutdownSession[] = []
+  let interruptedHeadsList: string[] = []
   let shutdownNotice: ShutdownNotice | null = null
   try {
     shutdownNotice = parseShutdownNotice(readFileSync(shutdownPath, 'utf8'))
@@ -302,10 +318,21 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     interruptedSessions = shutdownNotice.sessions.filter(
       ({ id }) => !ignoredByPrefix(id, config.ignoredSessionPrefixes),
     )
+    // The interrupted HEADS are the automatic resume-notify recipients. Heads
+    // are still NEVER pinned (the pin derivation + the boot-side pin guard
+    // below both keep ignoring them); only a head whose turn was genuinely cut
+    // by the restart gets a resume notice once it comes live.
+    interruptedHeadsList = interruptedHeads(
+      shutdownNotice.sessions,
+      config.ignoredSessionPrefixes,
+    )
     console.log(
       '[smart-restart] interrupted sessions at shutdown:',
       interruptedSessions.map((s) => s.id).join(', '),
     )
+    if (interruptedHeadsList.length > 0) {
+      console.log('[smart-restart] interrupted heads (resume recipients):', interruptedHeadsList.join(', '))
+    }
   }
   if (!pinnedTarget && shutdownNotice) {
     const target = shutdownTarget(shutdownNotice, Date.now(), config.shutdownGraceMs)
@@ -328,23 +355,26 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   const deliveredIds = new Set<string>()
   let deliveredPrimary = false
   let deliveredAny = false
+  // Automatic resume notices to interrupted heads (fb-168) are tracked
+  // SEPARATELY: delivering to a head must never mark the MAIN once-per-boot
+  // notice as delivered (the pin/target delivery stays independent).
+  const headResumeDelivered = new Set<string>()
 
   // --- 3b. Smart shutdown activity tracking (apply-scoped). ---------------
   // Track the SET of sessions active (mid-turn) at any moment so that, if this
   // process is stopped by a plain SIGTERM/SIGINT (a restart NOT triggered
   // through the smart_restart tool, or a restart while agents were active), the
   // shutdown hook below can record WHICH sessions to auto-notify on the next
-  // boot — instead of only the single most-recently-active one.
+  // boot — instead of only the single most-recently-active one. EVERY session
+  // is tracked — INCLUDING ignored-prefix ones (deepartments `head-*` heads):
+  // the shutdown notice must record the heads whose turns were cut so the next
+  // boot can auto-notify them (fb-168 resume path). The ignored-prefix filter
+  // still applies where it matters: the single-session PIN derivation
+  // (writeShutdownNotice) and the boot-side pin guard keep ignoring heads, so
+  // a head is never pinned with a spurious notice (0.3.1).
   const activeSessions = new Map<string, number>() // sessionId -> lastStepAt
   const recordActivity = (agent: Agent) => {
-    // NEVER track a deepartments head session: an ignored session's activity is
-    // treated as if it never happened, so only NON-ignored sessions can be
-    // recorded (and if only heads were active, nothing is recorded at all).
-    // This prevents a head from ever receiving a spurious post-restart notice.
-    // Configurable via `ignoredSessionPrefixes` (default `['head-']`).
-    const sid = String(agent.id)
-    if (ignoredByPrefix(sid, config.ignoredSessionPrefixes)) return
-    activeSessions.set(sid, Date.now())
+    activeSessions.set(String(agent.id), Date.now())
   }
   // A turn closing NORMALLY (inbox drained, nextStep empty ⇒ the turn is about
   // to close cleanly) means the session is no longer mid-turn. Remove it so a
@@ -461,11 +491,71 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
     return agentIsRoot(agent) ? `${id} (main)` : `${id} (worker)`
   }
 
+  // The combined human label for every session the shutdown cut (heads +
+  // workers), rendered in each interrupted head's resume notice.
+  const interruptedLabels = (): string[] => [
+    ...interruptedSessions.map(({ id }) => describeInterrupted(id)),
+    ...interruptedHeadsList.map((id) => describeInterrupted(id)),
+  ]
+
+  // --- 3d. Automatic resume notice for an interrupted head (fb-168). --------
+  // A head whose turn was cut by the restart (a shutdown-notice session
+  // matching the ignored prefixes) receives its own post-restart notice once it
+  // comes live at boot — the organization must never hang idle post-restart
+  // without knowing (fb-46). Same plugin-source channel as the main notice
+  // (followup/inject, form 'notice'); tracked in `headResumeDelivered`, NEVER in
+  // `deliveredIds`/`deliveredAny`, so it cannot suppress the main pin/target
+  // delivery (deliverHeadResume still skips a session that already got a notice
+  // via a config.target 'all' delivery).
+  const deliverHeadResume = (agent: Agent): void => {
+    const sid = String(agent.id)
+    if (headResumeDelivered.has(sid)) return
+    if (deliveredIds.has(sid)) return // already received a notice via target/session
+    headResumeDelivered.add(sid)
+    const text = buildNotice({
+      bootAt,
+      prevBootAt,
+      downtimeMs,
+      customNotice: config.notice,
+      reason: 'the process was stopped while this session was active',
+      interrupted: interruptedLabels(),
+    })
+    const msg: UserMessage = createUserMessage({
+      content: [{ type: 'text', text }],
+      source: {
+        kind: 'plugin',
+        plugin: 'dsh-smart-restart',
+        form: 'notice',
+        summary: `Smart-restart: the DSH service restarted at ${bootAt}; an interrupted head session was resumed`,
+      },
+    })
+    try {
+      if (config.wakeup !== false) {
+        // Wake the idle agent AND deliver the notice in one call — never inject
+        // the same message alongside followup (inbox "already pending").
+        agent.followup(msg)
+      } else {
+        agent.inject(msg)
+      }
+      console.log('[smart-restart] resume notice delivered to interrupted head', sid)
+    } catch (err) {
+      console.warn('[smart-restart] head resume notice failed:', err)
+    }
+  }
+
   // --- 4. Primary hook: wake on the startup session-start publication. ----
   ctx.on('agent/session-start', ({ agent, source }) => {
     // Track last activity for the smart shutdown auto-notification (any agent,
     // any source, regardless of restart state).
     recordActivity(agent)
+    // Automatic resume notify for interrupted heads (fb-168): an interrupted
+    // head that comes live at boot gets its resume notice — source-agnostic
+    // like the pinned path, because a head RESUMES with source 'resume', not
+    // 'startup'. Independent of the main pin/target delivery (which a head is
+    // never part of).
+    if (wasRestart && interruptedHeadsList.includes(String(agent.id))) {
+      deliverHeadResume(agent)
+    }
     if (!wasRestart || !deliveryPending()) return
     // A pinned target (tool-caller wins) is source-agnostic: a session that
     // RESUMES from a previous process publishes with `source: 'resume'` (not
@@ -509,47 +599,85 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   // with any source may never surface for it. So instead of a single one-shot
   // timer, poll at PENDING_POLL_MS up to a PENDING_POLL_MAX_MS window and
   // deliver the moment the pinned session is live. Non-pinned (config.target)
-  // behavior stays one-shot on the first tick, then the loop stops.
+  // behavior stays one-shot on the first tick. The SAME bounded poll delivers
+  // the fb-168 automatic resume notices to the interrupted heads as each one
+  // comes live — independent of the main notice bookkeeping.
   const pollStartedAt = Date.now()
   let nonPinnedFired = false
+  // One-shot `config.target` fallback shared by the pinned-window-expired path
+  // and the non-pinned first tick (unchanged v0.2 semantics).
+  const runTargetFallback = (): void => {
+    const roots = ctx.agents.roots()
+    if (config.target === 'primary') {
+      const primary = roots[0] ?? ctx.agents.list()[0]
+      if (primary) deliver(primary)
+    } else if (config.target === 'all') {
+      for (const root of roots) deliver(root)
+    } else {
+      const target = ctx.agents.get(SessionId(config.target))
+      if (target) deliver(target)
+    }
+  }
   const pollInterval = setInterval(() => {
-    if (!wasRestart || deliveredAny) {
+    if (!wasRestart) {
       clearInterval(pollInterval)
       return
     }
+    const windowExpired = Date.now() - pollStartedAt >= PENDING_POLL_MAX_MS
     try {
-      const windowExpired = Date.now() - pollStartedAt >= PENDING_POLL_MAX_MS
+      // 1) Interrupted-head resume notices — independent of the main notice:
+      //    deliver to each interrupted head the moment it comes live, bounded
+      //    by the same poll window (heads resume lazily, like a pinned
+      //    session). A head that never comes live within the window gets no
+      //    notice — the runtime's own resumed-turn flow handles it.
+      for (const headId of interruptedHeadsList) {
+        if (headResumeDelivered.has(headId)) continue
+        const head = ctx.agents.get(SessionId(headId))
+        if (head) deliverHeadResume(head)
+      }
+      const headsPending = interruptedHeadsList.some((h) => !headResumeDelivered.has(h))
+
+      // 2) Main notice (pinned / config.target) — unchanged v0.2 semantics:
+      //    pinned waits for the late-resuming session (bounded), then falls
+      //    back to `target` once; non-pinned is one-shot on the first tick.
+      let mainSettled = false
       if (pinnedTarget) {
-        // Reliable mechanism for a tool-caller session that resumes late:
-        // poll until it is live (bounded), then deliver to it.
         const pinned = ctx.agents.get(SessionId(pinnedTarget))
         if (pinned) {
           deliver(pinned)
-          clearInterval(pollInterval)
-          return
+          mainSettled = true
+        } else if (!windowExpired) {
+          if (!headsPending) return // keep waiting for the pinned session
+        } else {
+          // Pinned session never came live within the window: one-shot target
+          // fallback so the notice still lands somewhere.
+          if (!nonPinnedFired) {
+            nonPinnedFired = true
+            runTargetFallback()
+          }
+          mainSettled = true
         }
-        if (!windowExpired) return // keep waiting for the late-resuming session
-        // Pinned session never came live within the window: do the existing
-        // `target` fallback once so the notice still lands somewhere.
       } else {
-        // Non-pinned stays one-shot: the fallback runs once, then stop.
-        if (nonPinnedFired) {
-          clearInterval(pollInterval)
-          return
+        // Non-pinned stays one-shot: the target fallback runs on the first
+        // tick, after which only interrupted heads may still be pending.
+        if (!nonPinnedFired) {
+          nonPinnedFired = true
+          runTargetFallback()
         }
-        nonPinnedFired = true
+        mainSettled = true
       }
-      const roots = ctx.agents.roots()
-      if (config.target === 'primary') {
-        const primary = roots[0] ?? ctx.agents.list()[0]
-        if (primary) deliver(primary)
-      } else if (config.target === 'all') {
-        for (const root of roots) deliver(root)
-      } else {
-        const target = ctx.agents.get(SessionId(config.target))
-        if (target) deliver(target)
+      if (deliveredAny) mainSettled = true
+
+      // 3) Stop when the main notice is settled AND no interrupted head is
+      //    still pending inside the window (or the window expired).
+      if (mainSettled && (!headsPending || windowExpired)) {
+        clearInterval(pollInterval)
+        return
       }
-      clearInterval(pollInterval)
+      if (windowExpired) {
+        clearInterval(pollInterval)
+        return
+      }
     } catch (err) {
       console.warn('[smart-restart] fallback delivery failed:', err)
     }
@@ -568,20 +696,26 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   const shutdownDocPath = join(markerDir, 'shutdown-notice.json')
   const writeShutdownNotice = () => {
     try {
-      // Sessions active within the grace window at shutdown, minus any ignored
-      // (e.g. deepartments `head-*`) session — defense in depth on top of the
-      // filter in recordActivity, so a head can never appear in the notice.
+      // Sessions active within the grace window at shutdown — the FULL set,
+      // INCLUDING ignored-prefix (deepartments `head-*`) sessions: the doc's
+      // sessions list is the interrupted set the next boot auto-notifies, and
+      // an interrupted HEAD must be notified too (fb-168 resume path; the org
+      // must never hang post-restart). The ignored-prefix filter still applies
+      // to the single-session PIN derivation below (lastSessionId), so the pin
+      // — and the boot-side shutdownTarget guard — never target a head (0.3.1).
       const now = Date.now()
       const sessions: ShutdownSession[] = [...activeSessions.entries()]
         .filter(([, at]) => now - at <= config.shutdownGraceMs)
         .map(([id, at]) => ({ id, lastActiveAt: new Date(at).toISOString() }))
-        .filter(({ id }) => !ignoredByPrefix(id, config.ignoredSessionPrefixes))
       if (sessions.length === 0) return // nothing was active; do not write a notice
-      // Keep the single-session pin behavior: derive `lastSessionId` from the
-      // entry with the MAX timestamp, so the boot-side `shutdownTarget` (which
-      // pins delivery to one session) keeps pointing at the most-recently-active
-      // session without regression.
-      const primary = sessions.reduce((a, b) =>
+      // The pin session: the max-timestamp NON-ignored entry when one exists
+      // (unchanged 0.3.1 behavior — heads are never the pin), else the
+      // max-timestamp entry (a heads-only shutdown: the boot-side pin guard
+      // still refuses to pin an ignored session, so this is only enough to
+      // keep the doc valid and let the resume notification flow).
+      const pinnable = sessions.filter(({ id }) => !ignoredByPrefix(id, config.ignoredSessionPrefixes))
+      const pool = pinnable.length > 0 ? pinnable : sessions
+      const primary = pool.reduce((a, b) =>
         Date.parse(a.lastActiveAt) >= Date.parse(b.lastActiveAt) ? a : b,
       )
       mkdirSync(markerDir, { recursive: true })
@@ -635,7 +769,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
       defineTool({
         name: 'smart_restart',
         description:
-          'Restart the DSH service via systemd and, after it comes back up, deliver the smart-restart notice to THIS session so the interrupted task resumes automatically. WARNING: restarting the service any other way (raw systemctl/reboot) while subagents/workers have active turns kills them mid-flight — their sessions end "Stopped" (turn reason: interrupted) and the tool result is "outcome unknown". Use this tool for any restart with live work; the canary param aborts on an unhealthy boot.',
+          'Restart the DSH service via systemd and, after it comes back up, deliver the smart-restart notice to THIS session so the interrupted task resumes automatically. HARD GUARD: the tool reads the LIVE agent registry and REFUSES to restart while OTHER sessions are mid-turn (status running) — it returns the in-flight session list instead; pass force:true only after explicitly confirming that interrupting that work is safe (the override is always visible in the log). WARNING: restarting the service any other way (raw systemctl/reboot) while subagents/workers have active turns kills them mid-flight — their sessions end "Stopped" (turn reason: interrupted) and the tool result is "outcome unknown". Use this tool for any restart with live work; the canary param aborts on an unhealthy boot.',
         parameters: {
           reason: {
             type: 'string',
@@ -646,6 +780,11 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
             type: 'boolean',
             description:
               'Optional: validate the restart with a canary pre-flight first — boots an ephemeral DSH instance (same binary/profile as this unit) on a temp free port with a temp state overlay, probes HTTP health plus the client boot graph (every /plugins/<id>/client.js must register its graph row id), and aborts the restart on failure. Overrides the configured `canary` for this call.',
+          },
+          force: {
+            type: 'boolean',
+            description:
+              'Optional: override the read-before-edit guard — restart even when OTHER sessions are mid-turn. The tool refuses (returns the in-flight session list) unless this is true; the override and the in-flight list are ALWAYS logged. Use only after explicitly confirming the in-flight work is safe to interrupt.',
           },
         },
         output: {
@@ -660,6 +799,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
               error: { type: 'string' },
               canary: { type: 'string' },
               canaryDetail: { type: 'string' },
+              inFlight: { type: 'array', items: { type: 'string' } },
             },
           },
           render: (_args, value) => {
@@ -692,6 +832,16 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
         async execute(args, exec): Promise<SmartRestartOutcome> {
           const guard = guardRestart(effectiveRestartUnit, exec)
           if (!guard.ok) return guard.result
+          // fb-168 (a) — READ-BEFORE-EDIT guard: the tool consults the LIVE
+          // agent registry (ctx.agents, status === 'running') BEFORE anything
+          // is persisted or spawned and refuses to restart while OTHER
+          // sessions are mid-turn (the calling session is excluded: it
+          // restarts itself intentionally and is pinned for resume). Blind
+          // interruption becomes structurally impossible; an explicit
+          // force:true override is the only way through and is ALWAYS logged.
+          const force = args.force === true
+          const activeGuard = checkActiveGuard(ctx, guard.sessionId, force)
+          if (!activeGuard.ok) return activeGuard.result
           // RD #483 (b): durable checkpoint of the CALLING session before the
           // fire-and-forget spawn. The core's checkpoint policy already flushes
           // the session BEFORE the tool body (dsh-session-checkpoint-policy
@@ -733,6 +883,15 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
                 canaryDetail: canary.detail,
                 error: 'canary failed; restart aborted',
               }
+            }
+            // The canary window (up to canaryTimeoutMs) is long: RE-CHECK the
+            // live registry right before the spawn — a session may have started
+            // a turn while the canary booted, and the final gate must reflect
+            // the CURRENT state (never the check at call entry).
+            const recheck = checkActiveGuard(ctx, guard.sessionId, force)
+            if (!recheck.ok) {
+              console.warn('[smart-restart] smart_restart: active-agent guard re-check blocked the restart after the canary:', recheck.inFlight.join(', '))
+              return recheck.result
             }
             // passed / skipped → proceed with the normal restart and carry the
             // canary outcome onto the result.
@@ -786,6 +945,55 @@ function guardRestart(
     return { ok: false, result: { ok: false, restarting: false, error: 'no calling session' } }
   }
   return { ok: true, unit, sessionId }
+}
+
+/**
+ * fb-168 (a) — the read-before-edit guard for the smart_restart tool, wired to
+ * the LIVE DSH agent registry.
+ *
+ * Snapshots `ctx.agents` (the same in-process registry the runtime derives
+ * "running" from: `agents.get(id).status === 'running'`) and feeds it to the
+ * pure `activeAgentGuard` decision: the restart is REFUSED when any session
+ * OTHER than the caller is mid-turn, with the in-flight list returned. The
+ * registry is synchronously updated by the harness on every `agent/status`
+ * transition, so this check can never be stale the way file-based state
+ * (posts.json / a prior dept_who) could — the exact failure mode of the
+ * 2026-09-05 incident. An explicit `force` override is the only way through and
+ * is ALWAYS visible in the log (with the in-flight list).
+ */
+function checkActiveGuard(
+  ctx: Context,
+  callingSessionId: string,
+  force: boolean,
+): { ok: true; inFlight: string[] } | { ok: false; result: SmartRestartOutcome; inFlight: string[] } {
+  const live = ctx.agents.list()
+  const g = activeAgentGuard(
+    live.map((a) => ({ id: a.id, status: a.status })),
+    callingSessionId,
+    force,
+  )
+  if (g.inFlight.length > 0) {
+    console.warn(
+      force
+        ? `[smart-restart] smart_restart: FORCE override — restarting with ${g.inFlight.length} other session(s) mid-turn: ${g.inFlight.join(', ')}`
+        : `[smart-restart] smart_restart: BLOCKED — ${g.inFlight.length} other session(s) mid-turn: ${g.inFlight.join(', ')}; pass force:true to override`,
+    )
+  } else if (force) {
+    console.warn('[smart-restart] smart_restart: FORCE override requested — 0 other sessions mid-turn')
+  } else {
+    console.warn('[smart-restart] smart_restart: active-agent guard — 0 other sessions mid-turn')
+  }
+  if (g.allowed) return { ok: true, inFlight: g.inFlight }
+  return {
+    ok: false,
+    inFlight: g.inFlight,
+    result: {
+      ok: false,
+      restarting: false,
+      error: `refusing to restart: ${g.inFlight.length} other session(s) mid-turn (${g.inFlight.join(', ')}) — pass force:true to override`,
+      inFlight: g.inFlight,
+    },
+  }
 }
 
 /** Restart the DSH systemd unit and pin the notice to the calling session. */

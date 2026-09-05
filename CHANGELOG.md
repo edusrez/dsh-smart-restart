@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Read-before-edit guard for `smart_restart` (fb-168).** Before persisting anything or spawning the restart, the tool now reads the **live agent registry** inside the DSH process (`ctx.agents`, `status === 'running'` — the same in-process signal the runtime derives "running" from, so it can never be stale like file-based state) and **refuses** the restart when any session other than the calling session is mid-turn, returning the in-flight session list. An explicit `force: true` override is the only way through and is always logged with the list; the check re-runs after a canary pass, right before the spawn. A blind interruption of live agent turns is structurally impossible.
+- **Automatic resume notification to interrupted heads (fb-46).** The shutdown notice now records EVERY session active within the grace window — including the `ignoredSessionPrefixes` sessions (Deepartments `head-<postId>` heads by default) — and at boot each interrupted head receives its OWN resume notice once it comes live, so the organization never hangs idle post-restart without knowing. Heads are still never pinned as the single-session last-active target (the v0.3.1 behavior is preserved); only a head whose turn was genuinely cut is notified.
+- Pure-logic unit tests for `activeAgentGuard` (blocks with other sessions running; caller excluded; passes with 0 running; `force:true` override keeps the in-flight list) and `interruptedHeads` (resume recipients = the ignored-prefix sessions of the interrupted list).
+
+### Changed
+
+- The `smart_restart` tool gains an optional `force` boolean parameter and an `inFlight: string[]` result field on a guard-blocked refusal; its description documents the hard guard.
+
 ## [0.5.1] - 2026-08-22
 
 ### Fixed
