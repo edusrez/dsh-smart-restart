@@ -127,6 +127,29 @@ export interface Config {
   /** Whole-phase budget (ms) for the canary's client-graph validation
    *  (default 15000). */
   canaryClientTimeoutMs: number
+  /** Post-boot AGENT-LIVENESS check (default true): every non-retired member
+   *  of the deepartments catalog (posts.json) must appear alive in the
+   *  runtime's live agent registry (the R8 liveness family) before the
+   *  restart proceeds. */
+  canaryAgentCheck: boolean
+  /** Catalog path the agent-liveness check reads (default
+   *  '/.deepartments/posts.json' — the deepartments runtime's durable
+   *  registry). */
+  canaryCatalogPath: string
+  /** Runtime stateDir whose R8/R9 marker files the markers check reads
+   *  (default '/.deepartments'). */
+  canaryRuntimeStateDir: string
+  /** Post-boot POOLER-HEALTH check (default true): probes /v1/models,
+   *  /usage and /__keypool/status on the ephemeral web port. A missing
+   *  endpoint (HTTP 404/405 — e.g. the fb-75 pooler-capacity lane deploy
+   *  PENDING) is a graceful skip, never a failure. */
+  canaryPoolerCheck: boolean
+  /** Whole-phase budget (ms) for the pooler-health probes (default 5000). */
+  canaryPoolerTimeoutMs: number
+  /** Post-boot RUNTIME-MARKERS check (default true): the R8 presence cache
+   *  (presence.json) and the R9 toolset-audit sidecar (toolset-audit.jsonl)
+   *  must exist and be well-formed. */
+  canaryMarkersCheck: boolean
 }
 
 const DEFAULTS: Config = {
@@ -150,6 +173,14 @@ const DEFAULTS: Config = {
   // Client-graph post-boot validation is ON by default once the canary runs.
   canaryClientCheck: true,
   canaryClientTimeoutMs: 15_000,
+  // The post-boot runtime hardening (agent liveness / pooler health / R8-R9
+  // markers) is ON by default once the canary runs.
+  canaryAgentCheck: true,
+  canaryCatalogPath: '/.deepartments/posts.json',
+  canaryRuntimeStateDir: '/.deepartments',
+  canaryPoolerCheck: true,
+  canaryPoolerTimeoutMs: 5_000,
+  canaryMarkersCheck: true,
 }
 
 /** Fallback poll interval while waiting for a pinned session to resume. */
@@ -779,7 +810,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           canary: {
             type: 'boolean',
             description:
-              'Optional: validate the restart with a canary pre-flight first — boots an ephemeral DSH instance (same binary/profile as this unit) on a temp free port with a temp state overlay, probes HTTP health plus the client boot graph (every /plugins/<id>/client.js must register its graph row id), and aborts the restart on failure. Overrides the configured `canary` for this call.',
+              'Optional: validate the restart with a canary pre-flight first — boots an ephemeral DSH instance (same binary/profile as this unit) on a temp free port with a temp state overlay, probes HTTP health plus the client boot graph (every /plugins/<id>/client.js must register its graph row id) plus the post-boot runtime checks (agent liveness, pooler health, R8/R9 markers), and aborts the restart on failure. Overrides the configured `canary` for this call.',
           },
           force: {
             type: 'boolean',

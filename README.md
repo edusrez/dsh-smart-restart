@@ -160,9 +160,10 @@ When enabled, the `smart_restart` tool can validate the launch **before** anythi
 
 1. **Resolves the dsh binary/profile** — an explicit `canaryBinary` / `canaryProfile` wins; otherwise both are derived from `systemctl show -p ExecStart <restartUnit>` (binary falls back to `dsh` on PATH). The `--profile` flag is omitted when no profile resolves.
 2. **Creates a temp state dir and a temp patch overlay** (`dsh --patch <tmp>/canary.patch.yml`, applied after the profile layer): the `smart-restart` row itself is disabled in the canary (`enabled: false`) and every `canaryStateDirOverrides` entry gets its `stateDir` redirected into the temp dir — so the canary never writes a marker, notice, or live board state.
-3. **Pre-flights the launch** with `--dump-config` (20s timeout; a compose failure aborts the restart).
+3. **Pre-flights the launch** with `--dump-config` (20s timeout; a compose failure aborts the restart) and **checks the dump is coherent** — the composed tree must be a valid entry list and the `smart-restart` row must be DISABLED in the canary (the patch applied; an enabled row would let the ephemeral write into the live state dir).
 4. **Boots the ephemeral instance** detached with the same overlay on an auto-picked free port (`canaryPort` when set) and **polls** `http://127.0.0.1:<port>/` until HTTP 200 or `canaryTimeoutMs` elapses (per-attempt 800ms; a refused connection or non-200 is "not yet").
-5. **Stops the ephemeral** (process-group kill) and returns: `passed` → the restart proceeds; `failed` → abort + alert the caller; `skipped` → the restart proceeds (a skip is not a failure).
+5. **Post-boot validation** — with the instance up, the canary checks: the **client boot graph** (default ON — every `/plugins/<id>/client.js` must register its graph row id); **agent liveness** (default ON — every non-retired member of the deepartments catalog must appear alive in the runtime's live agent registry); **pooler health** (default ON — `/v1/models`, `/usage` and `/__keypool/status`; a missing endpoint, e.g. the fb-75 pooler-capacity deploy pending, is a graceful skip) and the **R8/R9 runtime markers** (default ON — `presence.json` + `toolset-audit.jsonl` well-formed).
+6. **Stops the ephemeral** (process-group kill) and returns: `passed` → the restart proceeds; `failed` → abort + alert the caller; `skipped` → the restart proceeds (a skip is not a failure).
 
 **When it skips (never blocks)** — if the dsh binary/profile cannot be derived (no `systemctl` lookup result AND no explicit `canaryBinary`/`canaryProfile`), the canary reports `skipped` and the restart proceeds unchanged. Generic installs are therefore always safe: a canary failure only ever aborts a restart when *you* opted in with an actual, resolvable launch target.
 
@@ -292,6 +293,14 @@ All behavior is controlled through the plugin row's `config`:
 | `canaryProfile` | string | `''` | Explicit dsh profile for the canary launch; empty derives it from the unit's `ExecStart` (`--profile`). |
 | `canaryBinary` | string | `''` | Explicit dsh binary for the canary launch; empty derives it from the unit's `ExecStart`, else `dsh` on PATH. |
 | `canaryStateDirOverrides` | object | `{}` | Plugin-row id → temp dir; those rows get their `stateDir` redirected in the canary patch so the ephemeral never writes live state (e.g. `deepartments: ''` keeps the canary off live board state). Relative or empty values resolve under the canary temp dir; absolute values are used verbatim. |
+| `canaryClientCheck` | boolean | `true` | Post-boot client-graph validation (P1 lesson): after liveness, parse `__DSH_BOOT__` from the served page and verify every row's `/plugins/<id>/client.js` bundle registers that row's id. A boot with no `__DSH_BOOT__` (non-web surface) passes trivially. |
+| `canaryClientTimeoutMs` | number | `15000` | Whole-phase budget (ms) for the client-graph validation. |
+| `canaryAgentCheck` | boolean | `true` | Post-boot AGENT-LIVENESS check (R8 liveness family): every NON-RETIRED member of the deepartments catalog (`posts.json`) must appear alive in the runtime's live agent registry before the restart proceeds. A member registered but missing from the live registry fails the canary (a restart that lands with heads/workers missing hangs the org). No catalog (generic install) → skip. |
+| `canaryCatalogPath` | string | `'/.deepartments/posts.json'` | Catalog path the agent-liveness check reads (the deepartments runtime's durable registry). |
+| `canaryRuntimeStateDir` | string | `'/.deepartments'` | Runtime stateDir whose R8/R9 marker files the markers check reads. |
+| `canaryPoolerCheck` | boolean | `true` | Post-boot POOLER-HEALTH check: probes `/v1/models`, `/usage` and `/__keypool/status` on the ephemeral web port. A missing endpoint (HTTP 404/405 — e.g. the fb-75 pooler-capacity deploy pending) is a graceful skip, never a failure; a 5xx or unreachable endpoint fails. |
+| `canaryPoolerTimeoutMs` | number | `5000` | Whole-phase budget (ms) for the pooler-health probes. |
+| `canaryMarkersCheck` | boolean | `true` | Post-boot RUNTIME-MARKERS check: the R8 presence cache (`presence.json`) and the R9 toolset-audit sidecar (`toolset-audit.jsonl`) must exist and be well-formed. Absent files (generic install) skip; a malformed file fails. |
 
 `target` semantics (fallback path only — a pending notice or a usable shutdown notice overrides `target` for that boot):
 
