@@ -50,7 +50,16 @@ import {
   type SmartRestartParams,
   type SmartRestartResult,
 } from './boot.js'
-import { runCanary, type CanaryResult } from './canary.js'
+import { DEFAULT_RUNTIME_STATE_DIR, runCanary, type CanaryResult } from './canary.js'
+// FB-234 — the INTENTIONAL-RESTART MARKER WRITER (see src/restart-reason.ts):
+// the GRACE-route selector, the boot-crash bootId anchor read and the atomic
+// tmp+rename write/clear the smart_restart tool performs BEFORE every kill.
+import {
+  clearRestartReasonMarker,
+  readCurrentBootId,
+  resolveRestartCause,
+  writeRestartReasonMarker,
+} from './restart-reason.js'
 
 /**
  * smart_restart call extended with the optional per-call canary gate.
@@ -60,6 +69,15 @@ import { runCanary, type CanaryResult } from './canary.js'
 export interface SmartRestartCall extends SmartRestartParams {
   /** Run the canary pre-restart validation for THIS call; overrides config.canary. */
   canary?: boolean
+  /** FB-234 — the INTENTIONAL restart family for THIS call, a token from the
+   * sanctioned GRACE set ['canary','deploy','dshmarket']: the tool then writes
+   * `<runtimeStateDir>/restart-reason.json` ATOMICALLY BEFORE the kill, so the
+   * next boot's boot-crash sidecar treats the previous boot as intentionally
+   * restarted (the crash streak never rises over it) and records the cause
+   * verbatim. ABSENT → the cause derives from the canary gate ('canary' when
+   * the gate ran), else NO marker (current crash semantics); a cause OUTSIDE
+   * the set is treated the same (no marker). */
+  cause?: string
   /** Explicit override of the read-before-edit guard (fb-168): restart even
    *  when OTHER sessions are mid-turn. Without it the tool refuses and returns
    *  the in-flight session list; the override is ALWAYS visible in the log. */
@@ -805,7 +823,12 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           reason: {
             type: 'string',
             description:
-              'Optional human-readable note, e.g. "installed dshmarket in stable+dev". Included in the post-restart notice.',
+              'Optional human-readable note, e.g. "installed dshmarket in stable+dev". Included in the post-restart notice AND (for an intentional GRACE restart, see `cause`) in the sidecar restart-reason marker. NO secrets — the value is persisted to disk.',
+          },
+          cause: {
+            type: 'string',
+            description:
+              "Optional: the INTENTIONAL restart family — one of canary | deploy | dshmarket (the FB-234 GRACE set). The tool writes <runtimeStateDir>/restart-reason.json ATOMICALLY BEFORE the kill so the next boot treats the previous boot as intentionally restarted (the crash streak never rises over it) and attributes the restart-registry row to this cause verbatim. Use it for an intentional restart of a HEALTHY process (canary re-boot / deploy / dshmarket upgrade); omit it for any other restart (no marker — current crash semantics).",
           },
           canary: {
             type: 'boolean',
@@ -863,6 +886,11 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
         async execute(args, exec): Promise<SmartRestartOutcome> {
           const guard = guardRestart(effectiveRestartUnit, exec)
           if (!guard.ok) return guard.result
+          // FB-234 — the RUNTIME stateDir the boot-crash sidecar reads/writes
+          // (`<stateDir>/boot-crash.json` + the `restart-reason.json` marker):
+          // the SAME resolution as the canary's runtime-marker check
+          // (canary.ts: `canaryRuntimeStateDir` || `/.deepartments`).
+          const runtimeStateDir = config.canaryRuntimeStateDir || DEFAULT_RUNTIME_STATE_DIR
           // fb-168 (a) — READ-BEFORE-EDIT guard: the tool consults the LIVE
           // agent registry (ctx.agents, status === 'running') BEFORE anything
           // is persisted or spawned and refuses to restart while OTHER
@@ -925,10 +953,14 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
               return recheck.result
             }
             // passed / skipped → proceed with the normal restart and carry the
-            // canary outcome onto the result.
-            return performRestart(args, exec, markerDir, effectiveRestartUnit, { status: canary.status, detail: canary.detail })
+            // canary outcome onto the result. The canary gate RAN: without an
+            // explicit cause this is a CANARY restart (GRACE family 'canary').
+            return performRestart(args, exec, markerDir, effectiveRestartUnit, {
+              runtimeStateDir,
+              canary: { status: canary.status, detail: canary.detail },
+            })
           }
-          return performRestart(args, exec, markerDir, effectiveRestartUnit)
+          return performRestart(args, exec, markerDir, effectiveRestartUnit, { runtimeStateDir })
         },
       }),
     )
@@ -1027,18 +1059,55 @@ function checkActiveGuard(
   }
 }
 
-/** Restart the DSH systemd unit and pin the notice to the calling session. */
+/** Restart the DSH systemd unit and pin the notice to the calling session.
+ * FB-234: BEFORE the kill, the INTENTIONAL-RESTART MARKER (`<runtimeStateDir>/
+ * restart-reason.json`) is written ATOMICALLY for a GRACE-family restart, or a
+ * stale marker is REMOVED for any other restart — the sidecar at the next boot
+ * then never raises the crash streak over an intentional restart. */
 function performRestart(
   args: SmartRestartCall,
   exec: { agent?: { id: unknown } },
   markerDir: string,
   restartUnit: string,
-  canary?: { status: 'passed' | 'skipped'; detail: string },
+  opts: {
+    /** FB-234 — the RUNTIME stateDir whose boot-crash sidecar + restart-reason
+     * marker this restart drives (resolved in the tool execute: the same dir
+     * the sidecar stamps boot-crash.json in). */
+    runtimeStateDir: string
+    /** The canary gate outcome when it RAN for this call (passed/skipped → the
+     * restart is canary-gated and, absent an explicit cause, gets the GRACE
+     * cause 'canary'); ABSENT → the gate did not run for this call. */
+    canary?: { status: 'passed' | 'skipped'; detail: string }
+  },
 ): SmartRestartOutcome {
   try {
     const guard = guardRestart(restartUnit, exec)
     if (!guard.ok) return guard.result
     const { unit, sessionId } = guard
+
+    // FB-234 — write the INTENTIONAL-RESTART MARKER BEFORE the kill (the
+    // marker must exist on disk before the process dies; the next apply start
+    // reads + consumes it). Only an explicit GRACE cause — or a canary gate
+    // that ran → 'canary' — yields a marker; a non-grace restart REMOVES any
+    // stale marker so it can never excuse this kill (current semantics = no
+    // marker). bootId is the CURRENT boot's id (the boot BEING KILLED), read
+    // from the boot-crash sidecar immediately before the write; a missing /
+    // unreadable sidecar → the marker is written WITHOUT the optional anchor
+    // (SPEC: a no-bootId marker excuses whatever previous boot the next apply
+    // start finds — the excusal is never lost to an absent sidecar file).
+    const cause = resolveRestartCause(args.cause, opts.canary !== undefined)
+    if (cause !== undefined) {
+      const bootId = readCurrentBootId(opts.runtimeStateDir)
+      const reason = typeof args.reason === 'string' && args.reason !== '' ? args.reason : undefined
+      writeRestartReasonMarker(opts.runtimeStateDir, {
+        cause,
+        ...(reason !== undefined ? { reason } : {}),
+        ts: Date.now(),
+        ...(bootId !== undefined ? { bootId } : {}),
+      })
+    } else {
+      clearRestartReasonMarker(opts.runtimeStateDir)
+    }
 
     // Persist the pending notice FIRST (synchronously, before any spawn) so it
     // survives the imminent service kill and targets the restarting session.
@@ -1060,10 +1129,10 @@ function performRestart(
     child.unref()
 
     const result: SmartRestartOutcome = { ok: true, restarting: true, sessionId, reason: pending.reason }
-    if (canary) {
-      result.canary = canary.status
+    if (opts.canary) {
+      result.canary = opts.canary.status
       // A skip carries its human detail; a pass is self-explanatory.
-      if (canary.status === 'skipped') result.canaryDetail = canary.detail
+      if (opts.canary.status === 'skipped') result.canaryDetail = opts.canary.detail
     }
     return result
   } catch (err) {
