@@ -16,6 +16,7 @@ import {
   checkRuntimeMarkers,
   clientBundleRegistersId,
   deriveExecStartParams,
+  deriveLiveStateDirOverrides,
   extractBootGraph,
   parseCatalogMembers,
   pickFreePort,
@@ -1178,4 +1179,110 @@ test('fb-234 A1 (e2e): with a dshd-core override the ephemeral apply lands in th
   } finally {
     envCleanup()
   }
+})
+
+// -------------------------------------------------------------------------
+// fb-234 GAP-2 (2026-09-09) — the BLANKET stateDir rewrite (acceptance (1) by
+// construction + future-row hardening): the canary patch is DERIVED from the
+// ephemeral's own --dump-config; EVERY row whose OWN stateDir resolves to the
+// LIVE store (/.deepartments OR the canonical relative .deepartments form) is
+// redirected to <tmpDir>/<id> — blinda dshd-core, dshd-health (inherits
+// deepartments.org ← dshd-core) and any FUTURE row, WITHOUT hardcoding the
+// row list (the A1 fragility). Rows already under a tmp overlay, rows with an
+// unrelated absolute path, and rows WITHOUT an own stateDir (inherited) are
+// left alone.
+// -------------------------------------------------------------------------
+const LIVE_DUMP = [
+  '# == dsh-base',
+  '- id: timer',
+  "  name: '@deepseek-ai/cordis-plugin-timer'",
+  '- id: smart-restart',
+  '  name: dsh-smart-restart',
+  '  config:',
+  '    enabled: false',
+  '    stateDir: .smart-restart',
+  '- id: dshd-core',
+  '  name: dshd-core',
+  '  config:',
+  '    stateDir: .deepartments',
+  '- id: deepartments',
+  '  name: dsh-deepartments',
+  '  config:',
+  '    stateDir: /.deepartments',
+].join('\n')
+
+test('fb-234 GAP-2 blanket (pure): deriveLiveStateDirOverrides returns {id:\'\'} for EVERY row whose own stateDir resolves to /.deepartments (.deepartments OR /.deepartments); buildPatchContent rewrites them under tmpDir; rows already under tmp, rows with unrelated absolute paths, and rows with NO own stateDir (inherited) are NOT rewritten', () => {
+  const dump = [
+    '- id: dshd-core',
+    '  name: dshd-core',
+    '  config:',
+    '    stateDir: .deepartments', // the canonical RELATIVE live row (cwd `/`)
+    '- id: deepartments',
+    '  name: dsh-deepartments',
+    '  config:',
+    '    stateDir: /.deepartments', // the ABSOLUTE live row
+    '- id: dshd-health',
+    '  name: dshd-health',
+    '  config:',
+    '    health: {}', // NO own stateDir → inherits deepartments.org → NOT rewritten
+    '- id: dshd-pooler',
+    '  name: dshd-pooler',
+    '  config:',
+    '    stateDir: /tmp/dsh-canary-safe/dshd-pooler', // already under a tmp overlay
+    '- id: dshd-webfetch',
+    '  name: dshd-webfetch',
+    '  config:',
+    '    stateDir: /var/lib/webfetch-state', // unrelated absolute path
+  ].join('\n')
+  const derived = deriveLiveStateDirOverrides(dump, '/tmp/dsh-canary-b')
+  assert.deepEqual(derived, { 'dshd-core': '', deepartments: '' }, 'ONLY the live-resolving rows are derived (no dshd-health/dshd-pooler/dshd-webfetch)')
+  // null/undefined/empty dumps are inert (never a throw).
+  assert.deepEqual(deriveLiveStateDirOverrides(null, '/tmp/x'), {})
+  assert.deepEqual(deriveLiveStateDirOverrides('', '/tmp/x'), {})
+  // The derived map feeds buildPatchContent — every derived row lands under tmpDir.
+  const patch = buildPatchContent('/tmp/dsh-canary-b', derived)
+  assert.ok(patch.includes('- id: dshd-core\n  config:\n    stateDir: "/tmp/dsh-canary-b/dshd-core"'), `dshd-core rewritten under tmpDir:\n${patch}`)
+  assert.ok(patch.includes('- id: deepartments\n  config:\n    stateDir: "/tmp/dsh-canary-b/deepartments"'), `deepartments rewritten under tmpDir:\n${patch}`)
+  // NOT rewritten (never referenced in the patch at all).
+  assert.ok(!patch.includes('dshd-health'), 'dshd-health (inherited stateDir) is NOT rewritten — covered transitively via deepartments.org')
+  assert.ok(!patch.includes('dshd-pooler'), 'already-under-tmp row NOT rewritten')
+  assert.ok(!patch.includes('dshd-webfetch'), 'unrelated absolute path NOT rewritten')
+})
+
+test('fb-234 GAP-2 blanket (runCanary e2e): with a dump-config carrying LIVE stateDir rows (dshd-core → .deepartments, deepartments → /.deepartments), the FULL derived-from-dump flow ends with a patch that rewrites BOTH under the ephemeral tmp overlay (the canary still passes)', async () => {
+  let spawnedPatch = null
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    dumpConfig: () => ({ ok: true, stderr: '', stdout: LIVE_DUMP }),
+    spawnBoot: (binary, profile, patchPath, port) => {
+      spawnedPatch = readFileSync(patchPath, 'utf8')
+      return { pid: 4315 }
+    },
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+  }
+  const r = await runCanary(
+    undefined,
+    {
+      ...baseCfg,
+      canaryPort: 41316,
+      canaryClientCheck: false,
+      canaryAgentCheck: false,
+      canaryPoolerCheck: false,
+      canaryMarkersCheck: false,
+    },
+    {},
+    hooks,
+  )
+  assert.equal(r.status, 'passed')
+  assert.ok(spawnedPatch !== null, 'the ephemeral was spawned with the final (derived) patch')
+  // The discovery dump revealed the LIVE rows → the final patch redirects them
+  // to ABSOLUTE under-tmp paths (never the bare .deepartments / /.deepartments).
+  assert.match(spawnedPatch, /- id: dshd-core\n  config:\n    stateDir: "\//, `dshd-core now resolves under tmpDir:\n${spawnedPatch}`)
+  assert.match(spawnedPatch, /- id: deepartments\n  config:\n    stateDir: "\//, `deepartments now resolves under tmpDir:\n${spawnedPatch}`)
+  assert.ok(!/- id: dshd-core[\s\S]*stateDir: "?\.deepartments"?/.test(spawnedPatch), 'the bare relative .deepartments is GONE from the dshd-core row')
+  assert.ok(!/- id: deepartments[\s\S]*stateDir: "\/\.deepartments"/.test(spawnedPatch), 'the absolute /.deepartments is GONE from the deepartments row')
+  // No derived row is left pointing at the live store.
+  assert.ok(!spawnedPatch.includes('stateDir: "/.deepartments"'), 'no row resolves to /.deepartments in the final patch')
+  assert.ok(!/- id: [a-z-]+[\s\S]*stateDir: "?\.deepartments"?/.test(spawnedPatch), 'no row resolves to the bare .deepartments in the final patch')
 })

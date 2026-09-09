@@ -232,6 +232,83 @@ function resolveOverrideDir(dir: string, key: string, tmpDir: string): string {
   return isAbsolute(dir) ? dir : join(tmpDir, dir)
 }
 
+/**
+ * FB-234 GAP-2 (2026-09-09) — the BLANKET stateDir rewrite. True when a
+ * `stateDir` value resolves to the LIVE canonical store.
+ *
+ * The canonical live store is `/.deepartments` (the dev profile declares the
+ * RELATIVE `.deepartments` from dshd-core; under systemd the unit runs with
+ * cwd `/` so it resolves to `/.deepartments`). We catch BOTH the absolute
+ * `/.deepartments` (and any `/.deepartments/...` descendant) AND the bare
+ * relative `.deepartments` form (the canonical relative row that resolves live
+ * under the daemon's `/` cwd). Catching the relative form matters for
+ * defense-in-depth: it makes the canary redirect the row to an EXPLICIT
+ * absolute-under-tmp path, immune to any future cwd change (the A2 reliance).
+ * Rows already under the tmp overlay, rows with an unrelated absolute path,
+ * and rows WITHOUT an own stateDir (inherited via deepartments.org ←
+ * dshd-core) are left alone.
+ */
+function resolvesToLiveStateDir(stateDir: string): boolean {
+  const clean = stateDir.trim().replace(/\/+$/, '')
+  return clean === '/.deepartments' || clean === '.deepartments' || clean.startsWith('/.deepartments/')
+}
+
+/**
+ * FB-234 GAP-2 (2026-09-09) — the BLANKET stateDir override derivation. Parse a
+ * canary `--dump-config` entry-list (the SAME structural family
+ * checkDumpConfigCoherent parses: `- id:` rows at column 0, config keys
+ * indented) and return `{ id: '' }` for EVERY row whose OWN `stateDir` value
+ * resolves to the LIVE store (`/.deepartments` — resolvesToLiveStateDir).
+ *
+ * Feeding the result into `buildPatchContent` redirects each such row to
+ * `join(tmpDir, id)` — so the ephemeral canary NEVER applies against the live
+ * store, regardless of whether the row is listed in `canaryStateDirOverrides`
+ * (the A1 list — whose incompleteness was the original leak). This blinda
+ * dshd-core, dshd-health (which inherits deepartments.org ← dshd-core) and any
+ * FUTURE row that declares a live stateDir, WITHOUT hardcoding the row list.
+ * The explicit (A1) overrides are merged by the caller and win on collision
+ * (same tmp-subdir semantics). Null/undefined/empty or malformed dumps yield
+ * `{}` (no row to rewrite) — never a throw.
+ */
+export function deriveLiveStateDirOverrides(dumpYaml: string | null | undefined, tmpDir: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (dumpYaml === null || dumpYaml === undefined) return out
+  const text = String(dumpYaml)
+  if (text.trim() === '') return out
+  const lines = text.trimEnd().split('\n')
+  let currentRow: string | undefined
+  const rowBodies: Map<string, string[]> = new Map()
+  const order: string[] = []
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '')
+    if (line.trim() === '') continue
+    if (line.trimStart().startsWith('#')) continue
+    if (/^- id: \S+/.test(line)) {
+      currentRow = line.replace(/^- id: /, '').trim()
+      if (!rowBodies.has(currentRow)) {
+        rowBodies.set(currentRow, [])
+        order.push(currentRow)
+      }
+      continue
+    }
+    if (currentRow === undefined) continue
+    rowBodies.get(currentRow)!.push(line)
+  }
+  for (const id of order) {
+    const body = rowBodies.get(id)!
+    for (const b of body) {
+      // The row's OWN stateDir (4-space config key; the first occurrence wins).
+      const m = b.match(/^ {2,}stateDir:\s*(.*)$/)
+      if (!m) continue
+      const value = stripQuotes(m[1].trim())
+      if (resolvesToLiveStateDir(value)) out[id] = ''
+      break
+    }
+  }
+  return out
+}
+
+
 function stripQuotes(tok: string): string {
   if (tok.length >= 2) {
     const first = tok.charAt(0)
@@ -1124,9 +1201,32 @@ export async function runCanary(
 
     const port = cfg.canaryPort > 0 ? cfg.canaryPort : await (hooks.pickFreePort ?? pickFreePort)()
     const patchPath = join(tmpDir, 'canary.patch.yml')
-    writeFileSync(patchPath, buildPatchContent(tmpDir, cfg.canaryStateDirOverrides), 'utf8')
+    const dumpConfig = hooks.dumpConfig ?? dumpConfigDefault
 
-    const preflight = (hooks.dumpConfig ?? dumpConfigDefault)(target.binary, target.profile, patchPath)
+    // FB-234 GAP-2 (2026-09-09) — the BLANKET stateDir rewrite (defense for
+    // acceptance (1): NO ephemeral apply EVER touches /.deepartments, for
+    // dshd-core, dshd-health and FUTURE rows). The canary patch is now DERIVED
+    // from the ephemeral's OWN --dump-config instead of only the explicit
+    // canaryStateDirOverrides list (whose incompleteness was the A1 leak):
+    //   1) a DISCOVERY dump with a smart-restart-ONLY patch (NO stateDir
+    //      redirects) reveals the TRUE composed stateDirs of the live profile
+    //      — the rows whose own stateDir resolves to the LIVE store;
+    //   2) deriveLiveStateDirOverrides turns those into `{ id: '' }` overrides,
+    //      merged with the explicit (A1) map (the derived rows win on collision
+    //      — same tmp-subdir semantics, A1 stays coherent: '' resolves under
+    //      tmpDir);
+    //   3) the FULL patch is written, then an INTEGRITY dump WITH it confirms
+    //      coherence (smart-restart disabled + the derived rows resolved).
+    const discoveryPatch = buildPatchContent(tmpDir, {})
+    writeFileSync(patchPath, discoveryPatch, 'utf8')
+    const discovery = dumpConfig(target.binary, target.profile, patchPath)
+    if (!discovery.ok) {
+      return { status: 'failed', detail: `dump-config failed: ${discovery.stderr}` }
+    }
+    const derivedOverrides = deriveLiveStateDirOverrides(discovery.stdout, tmpDir)
+    writeFileSync(patchPath, buildPatchContent(tmpDir, { ...cfg.canaryStateDirOverrides, ...derivedOverrides }), 'utf8')
+
+    const preflight = dumpConfig(target.binary, target.profile, patchPath)
     if (!preflight.ok) {
       return { status: 'failed', detail: `dump-config failed: ${preflight.stderr}` }
     }
