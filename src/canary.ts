@@ -6,7 +6,10 @@
  * same binary as the systemd unit (derived from `systemctl show -p
  * ExecStart`), on an auto-picked free port, under a temp state overlay
  * (`dsh --patch` applied after the profile layer: this plugin disabled and
- * the listed rows' stateDir redirected into the temp dir), then probes HTTP
+ * the listed rows' stateDir redirected into the temp dir), booted with
+ * `cwd = <the temp overlay dir>` so a RELATIVE stateDir row also lands in the
+ * temp store (fb-234 acceptance-1 — the ephemeral never touches the LIVE
+ * stateDir), then probes HTTP
  * liveness on that port and — default ON — validates the CLIENT boot graph:
  * it parses `__DSH_BOOT__` from the served page and proves every graph row's
  * `/plugins/<id>/client.js` bundle registers that row's id (the loader
@@ -24,7 +27,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 
 export type CanaryStatus = 'passed' | 'failed' | 'skipped'
 
@@ -92,7 +95,10 @@ export interface CanaryHooks {
   /** Pre-flight `--dump-config`; ok=false carries bounded stderr. The stdout
  *  is carried alongside (the config-integrity check reads it). */
   dumpConfig?: (binary: string, profile: string, patchPath: string) => { ok: boolean; stderr: string; stdout?: string }
-  /** Boot the ephemeral instance detached; returns the child or null when spawn failed. */
+  /** Boot the ephemeral instance detached; returns the child or null when spawn failed. The
+   *  default MUST boot with `cwd = <the patch's dir>` (the isolated per-canary tmp overlay) so
+   *  a RELATIVE stateDir row resolves inside the temp store, never the LIVE one (fb-234
+   *  acceptance-1); a replacement hook must preserve that isolation. */
   spawnBoot?: (binary: string, profile: string, patchPath: string, port: number) => ChildProcess | null
   /** Poll HTTP liveness on the port until healthy or the timeout elapses. */
   probeLiveness?: (port: number, timeoutMs: number) => Promise<boolean>
@@ -879,7 +885,19 @@ function spawnBootDefault(binary: string, profile: string, patchPath: string, po
   if (profile) argv.push('--profile', profile)
   argv.push('--patch', patchPath, '--port', String(port))
   try {
-    const child = spawn('setsid', argv, { detached: true, stdio: 'ignore' })
+    // FB-234 acceptance-1: boot the ephemeral with ITS OWN cwd = the isolated
+    // per-canary temp overlay dir (the dir that also holds the patch file —
+    // runCanary always writes the patch at `<tmpDir>/canary.patch.yml`, and
+    // removes the whole tmpDir in its finally). Without a cwd the child
+    // inherits the daemon's cwd (/ under systemd) and a RELATIVE stateDir row
+    // (the dev profile's `.deepartments` from dshd-core) resolves against the
+    // LIVE `/.deepartments` — the phantom-boot defect: the ephemeral apply
+    // stamped LIVE boot-crash.json with its own bootId and consumed the LIVE
+    // restart-reason marker, so the real boot lost its 'canary' excusal.
+    // With cwd = tmpDir the relative `.deepartments` resolves inside the temp
+    // store: 0 consume of the LIVE marker, 0 stamp of LIVE boot-crash.json, 0
+    // LIVE heartbeat from the canary (the ephemeral dies with its tmpDir).
+    const child = spawn('setsid', argv, { detached: true, stdio: 'ignore', cwd: dirname(patchPath) })
     child.unref()
     return child
   } catch {

@@ -3,6 +3,10 @@
 // no systemctl required, so they pass on any machine after `pnpm build`.
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   buildPatchContent,
   checkAgentLiveness,
@@ -901,4 +905,277 @@ test('runPostBootRuntimeChecks: disabled checks report per-phase notes without r
   assert.equal(r.ok, true)
   assert.equal(reads, 0)
   assert.match(r.detail, /agent-liveness check disabled/)
+})
+
+test('fb-234 (3) acceptance scenario: after a fixed canary the LIVE store still holds ONE coherent boot identity (bootStamp.bootId === heartbeat.bootId === the real live boot) — the honest-streak precondition for a marker-less crash AFTER a canary', async () => {
+  const { dshPath, liveStateDir, reportPath, envCleanup } = setupIsolationHarness()
+  try {
+    // The canary runs BEFORE the real kill (execute → runCanary → performRestart
+    // writes the GRACE marker): with the fix the ephemeral leaves ZERO huellas,
+    // so the store the NEXT real apply sees is exactly what a healthy boot
+    // leaves: boot-crash.json + health-heartbeat.json BOTH carrying the REAL
+    // (live) bootId. dshd-health's prevTicked identity (`prevHeartbeat.bootId
+    // === prev.bootId`, :879-880) then resolves TRUE against the live heartbeat
+    // — a subsequent REAL marker-less pre-tick crash (e.g. a bare restart)
+    // reads prev = the real live boot, marker absent → NO excusal → the streak
+    // rises honestly from a REAL previous boot, never from a phantom. The
+    // canary must not hand that logic a foreign stamp.
+    const r = await runCanary(undefined, ISOLATION_CFG(dshPath, { deepartments: '' }), {}, ISOLATION_HOOKS(liveStateDir, reportPath))
+    assert.equal(r.status, 'passed')
+    const eph = await waitForEphReport(reportPath)
+    assert.notEqual(eph.stateDir, liveStateDir, 'ephemeral did not apply against the LIVE store')
+    const bootCrash = JSON.parse(readFileSync(join(liveStateDir, 'boot-crash.json'), 'utf8'))
+    const heartbeat = JSON.parse(readFileSync(join(liveStateDir, 'health-heartbeat.json'), 'utf8'))
+    assert.equal(bootCrash.bootId, 'live-boot-1', 'LIVE boot-crash still the real boot')
+    assert.equal(heartbeat.bootId, 'live-boot-1', 'LIVE heartbeat still the real boot')
+    assert.equal(bootCrash.bootId, heartbeat.bootId, 'prevTicked identity coherent after a fixed canary')
+    assert.equal(existsSync(join(liveStateDir, 'restart-reason.json')), true, 'the GRACE marker survives for the REAL successor boot to consume')
+    // The marker content is the one THIS lane's GRACE writer produced (a live
+    // canary restart) — the real successor consume → recoveryCause \'canary\'
+    // → registry row \'canary\', NOT \'unknown\' (the acceptance-(2) case).
+    const marker = JSON.parse(readFileSync(join(liveStateDir, 'restart-reason.json'), 'utf8'))
+    assert.equal(marker.cause, 'canary')
+  } finally {
+    envCleanup()
+  }
+})
+
+// --- fb-234 acceptance-1: stateDir ISOLATION of the canary ephemeral ----------
+//
+// The live phantom defect: the canary's ephemeral boot ran WITHOUT a cwd
+// (spawnBootDefault spawned `setsid` with no `cwd`), inherited the daemon's
+// cwd (/), and the dev profile's RELATIVE `.deepartments` (dshd-core row)
+// resolved against the LIVE `/.deepartments` — so the ephemeral's own apply
+// (invoke.ts:4227-4228, dshd-health stamp/consume) drained the LIVE
+// restart-reason.json marker and stamped LIVE boot-crash.json with its OWN
+// randomUUID bootId (phantom b79cfcb8) → the real boot had no marker and the
+// registry showed 'unknown'. The fix: spawnBootDefault boots the ephemeral
+// with `cwd: <the per-canary tmp overlay dir>` so a RELATIVE stateDir row
+// resolves INSIDE the temp store (which runCanary removes in its finally) —
+// 0 consume of the LIVE marker, 0 stamp of LIVE boot-crash.json, 0 LIVE
+// heartbeat.
+//
+// These tests mount a fake LIVE store (marker GRACE + boot-crash + heartbeat
+// fixtures) + a fake `setsid`/fake `dsh` on PATH that mimic the ephemeral
+// apply's stateDir resolution (service-first from the patch's dshd-core row,
+// else cwd-relative `.deepartments` — boot.ts:357-365) and its side effects
+// (stamp boot-crash.json with an OWN randomUUID bootId + consume the marker +
+// write health-heartbeat.json). The FLIP reruns the identical flow with a
+// spawnBoot hook that spawns WITHOUT the isolated cwd (cwd = the live dir): it
+// MUST taint the live store — the discriminant that proves the test would fail
+// on the pre-fix code. Everything is sandboxed under one mkdtemp; the fake
+// `setsid` is `exec "$@"` so the real `spawn('setsid', ...)` runs the fake dsh.
+
+// The fake ephemeral dsh: resolves its stateDir exactly like the real bundle
+// (the patch's `- id: dshd-core` row when A1 redirects it — an ABSOLUTE tmp
+// path, or, when absent, the profile's RELATIVE `.deepartments` against the
+// process cwd), then leaves the three huellas (stamp + consume + heartbeat).
+const FAKE_EPH_DSH = `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const argv = process.argv.slice(2)
+const patchIdx = argv.indexOf('--patch')
+const patchPath = patchIdx >= 0 ? argv[patchIdx + 1] : null
+// Service-first resolution mirror (boot.ts:357-365): deepartments.org stateDir
+// comes from the patch's dshd-core row when present (A1: absolute tmp path),
+// else the dev profile's RELATIVE \`.deepartments\` resolved against cwd.
+let stateDir = path.join(process.cwd(), '.deepartments')
+if (patchPath && fs.existsSync(patchPath)) {
+  const patch = fs.readFileSync(patchPath, 'utf8')
+  const m = patch.match(/- id: dshd-core\\s*\\n\\s*config:\\s*\\n\\s*stateDir:\\s*"([^"]+)"/)
+  if (m) stateDir = m[1]
+}
+// The ephemeral apply side effects (dshd-health stamp + write-ahead consume):
+// the real ephemeral NEVER writes a heartbeat (its health tick — 60s interval
+// — never runs in the canary's short life), so this fake leaves the LIVE
+// heartbeat file strictly alone too — the trace-verified behavior (explore-deep
+// 806784e2 §1b): "el efímero no escribe heartbeat ni fila de registry".
+const bootId = 'eph-' + crypto.randomUUID()
+fs.mkdirSync(stateDir, { recursive: true })
+fs.writeFileSync(path.join(stateDir, 'boot-crash.json'), JSON.stringify({ bootId, crashStreak: 0 }))
+try { fs.rmSync(path.join(stateDir, 'restart-reason.json'), { force: true }) } catch {}
+// Report where THIS ephemeral applied (the test asserts against it).
+fs.writeFileSync(process.env.FAKE_EPH_REPORT, JSON.stringify({ stateDir, bootId, cwd: process.cwd(), patchPath }))
+`
+
+const FAKE_SETSID = '#!/bin/sh\nexec "$@"\n'
+
+/** Wait until the fake ephemeral's report file exists (the spawn is detached —
+ * the report appears only after ALL huellas were written, so its presence
+ * guarantees the apply finished before the test asserts). */
+async function waitForEphReport(reportPath, budgetMs = 5000) {
+  const deadline = Date.now() + budgetMs
+  for (;;) {
+    if (existsSync(reportPath)) return JSON.parse(readFileSync(reportPath, 'utf8'))
+    if (Date.now() > deadline) throw new Error(`fake ephemeral report not written within ${budgetMs}ms: ${reportPath}`)
+    await new Promise((r) => setTimeout(r, 10))
+  }
+}
+
+/** Build the harness sandbox: fakebin (setsid + dsh on PATH) + a fake LIVE
+ * store at <root>/live/.deepartments (marker GRACE + boot-crash + heartbeat).
+ * Returns {root, liveStateDir, reportPath, envCleanup, liveSnapshot}. */
+function setupIsolationHarness() {
+  const root = mkdtempSync(join(tmpdir(), 'fb234-isolation-'))
+  const fakeBin = join(root, 'fakebin')
+  const liveStateDir = join(root, 'live', '.deepartments')
+  const reportPath = join(root, 'eph-report.json')
+  mkdirSync(fakeBin)
+  mkdirSync(liveStateDir, { recursive: true })
+  writeFileSync(join(fakeBin, 'setsid'), FAKE_SETSID, { mode: 0o755 })
+  const dshPath = join(fakeBin, 'dsh')
+  writeFileSync(dshPath, FAKE_EPH_DSH, { mode: 0o755 })
+  // The fake LIVE store the ephemeral must NOT touch (what the real daemon
+  // leaves on the LIVE /.deepartments before a smart_restart).
+  writeFileSync(join(liveStateDir, 'boot-crash.json'), JSON.stringify({ bootId: 'live-boot-1', bootStartedAt: 1_000, crashStreak: 0 }), 'utf8')
+  writeFileSync(join(liveStateDir, 'restart-reason.json'), JSON.stringify({ cause: 'canary', ts: 1_500, bootId: 'live-boot-1' }), 'utf8')
+  writeFileSync(join(liveStateDir, 'health-heartbeat.json'), JSON.stringify({ bootId: 'live-boot-1', ts: 2_000, crashStreak: 0 }), 'utf8')
+  const liveFiles = ['boot-crash.json', 'restart-reason.json', 'health-heartbeat.json']
+  const liveSnapshot = Object.fromEntries(liveFiles.map((f) => [f, readFileSync(join(liveStateDir, f), 'utf8')]))
+  const prevPath = process.env.PATH
+  const prevReport = process.env.FAKE_EPH_REPORT
+  process.env.PATH = `${fakeBin}${process.env.PATH ? `:${process.env.PATH}` : ''}`
+  process.env.FAKE_EPH_REPORT = reportPath
+  const envCleanup = () => {
+    if (prevPath === undefined) delete process.env.PATH
+    else process.env.PATH = prevPath
+    if (prevReport === undefined) delete process.env.FAKE_EPH_REPORT
+    else process.env.FAKE_EPH_REPORT = prevReport
+    try {
+      rmSync(root, { recursive: true, force: true })
+    } catch {
+      // best-effort cleanup
+    }
+  }
+  return { root, fakeBin, dshPath, liveStateDir, reportPath, liveFiles, liveSnapshot, envCleanup }
+}
+
+const ISOLATION_HOOKS = (liveStateDir, reportPath, spawnOverride) => ({
+  execStartOfUnit: () => null, // binary comes from canaryBinary below
+  dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+  probeLiveness: async () => {
+    await waitForEphReport(reportPath)
+    return true
+  },
+  killProcessGroup: () => {}, // the fake dsh exits on its own
+  readCatalog: () => null,
+  readStateFile: () => null,
+  ...(spawnOverride ? { spawnBoot: spawnOverride } : {}),
+})
+
+const ISOLATION_CFG = (dshPath, overrides) => ({
+  ...baseCfg,
+  canaryBinary: dshPath,
+  canaryProfile: '',
+  canaryPort: 41420,
+  canaryStateDirOverrides: overrides,
+  canaryClientCheck: false,
+  canaryAgentCheck: false,
+  canaryPoolerCheck: false,
+  canaryMarkersCheck: false,
+})
+
+test('fb-234 A2: the ephemeral apply NEVER touches the LIVE store with the fix (0 consume / 0 stamp / 0 heartbeat) — isolated store under the canary tmpDir', async () => {
+  const { dshPath, liveStateDir, reportPath, liveFiles, liveSnapshot, envCleanup } = setupIsolationHarness()
+  try {
+    const r = await runCanary(undefined, ISOLATION_CFG(dshPath, { deepartments: '' }), {}, ISOLATION_HOOKS(liveStateDir, reportPath))
+    assert.equal(r.status, 'passed')
+    const eph = await waitForEphReport(reportPath)
+    // The ephemeral resolved its RELATIVE `.deepartments` against the isolated
+    // canary tmpDir (the fix: spawnBootDefault cwd = the patch's dir), NOT
+    // against the LIVE store.
+    assert.notEqual(eph.stateDir, liveStateDir, `ephemeral stateDir must not be the LIVE store (${eph.stateDir})`)
+    assert.ok(eph.stateDir.startsWith(join(tmpdir(), 'dsh-canary-')), `ephemeral stateDir should be under the canary tmpDir, got ${eph.stateDir}`)
+    assert.equal(eph.stateDir, join(eph.cwd, '.deepartments'), 'ephemeral resolved the RELATIVE .deepartments against its isolated cwd (the fix)')
+    // The LIVE store is byte-identical: marker NOT consumed, boot-crash NOT
+    // stamped, heartbeat NOT overwritten.
+    for (const f of liveFiles) {
+      assert.equal(readFileSync(join(liveStateDir, f), 'utf8'), liveSnapshot[f], `LIVE ${f} must be untouched by the canary`)
+    }
+  } finally {
+    envCleanup()
+  }
+})
+
+test('fb-234 FLIP (discriminant): WITHOUT the isolated cwd the SAME ephemeral DOES consume the LIVE marker + stamp LIVE boot-crash (no heartbeat — the ephemeral never ticks) — the pre-fix defect reproduced', async () => {
+  const { root, dshPath, liveStateDir, reportPath, envCleanup } = setupIsolationHarness()
+  try {
+    // Pre-fix spawnBoot behavior: spawn WITHOUT the isolated cwd. The unit cwd
+    // plays `/` (its `.deepartments` IS the live store) — exactly the dev
+    // profile's resolution before the fix.
+    const preFixSpawn = (binary, profile, patchPath, port) => {
+      const argv = [binary]
+      if (profile) argv.push('--profile', profile)
+      argv.push('--patch', patchPath, '--port', String(port))
+      const child = spawn('setsid', argv, { detached: true, stdio: 'ignore', cwd: join(root, 'live') })
+      child.unref()
+      return child
+    }
+    const r = await runCanary(undefined, ISOLATION_CFG(dshPath, { deepartments: '' }), {}, ISOLATION_HOOKS(liveStateDir, reportPath, preFixSpawn))
+    assert.equal(r.status, 'passed')
+    const eph = await waitForEphReport(reportPath)
+    // The ephemeral landed IN the live store...
+    assert.equal(eph.stateDir, liveStateDir)
+    assert.equal(eph.cwd, join(root, 'live'))
+    // ...and left the phantom huellas: marker CONSUMED + boot-crash stamped
+    // with its OWN bootId (a randomUUID ≠ the live boot). This is the exact
+    // phantom-boot class (b79cfcb8) the fix eliminates. The live heartbeat is
+    // NOT written by the ephemeral (its 60s tick never runs) — it stays at the
+    // REAL boot's id, so prevTicked identity (boot-crash.bootId ===
+    // heartbeat.bootId) is BROKEN: the next marker-less boot would read
+    // prev={phantom} vs heartbeat={real} and inflate streak +1 (dshd-health
+    // :879-881) — the phantom-risk double injury, both removed by the fix.
+    const bootCrash = JSON.parse(readFileSync(join(liveStateDir, 'boot-crash.json'), 'utf8'))
+    assert.equal(bootCrash.bootId, eph.bootId)
+    assert.notEqual(bootCrash.bootId, 'live-boot-1')
+    assert.equal(existsSync(join(liveStateDir, 'restart-reason.json')), false, 'marker consumed by the ephemeral (pre-fix)')
+    const heartbeat = JSON.parse(readFileSync(join(liveStateDir, 'health-heartbeat.json'), 'utf8'))
+    assert.equal(heartbeat.bootId, 'live-boot-1', 'ephemeral never writes a heartbeat (no tick in its short life)')
+    assert.notEqual(bootCrash.bootId, heartbeat.bootId, 'prevTicked identity broken by the phantom stamp (pre-fix)')
+  } finally {
+    envCleanup()
+  }
+})
+
+test('fb-234 A1 (patch-level): a dshd-core:"" override in canaryStateDirOverrides emits the dshd-core row with an ABSOLUTE tmp stateDir — the patch-level refuerzo for absolute-stateDir compositions', async () => {
+  const content = buildPatchContent('/tmp/dsh-canary-a1', { deepartments: '', 'dshd-core': '' })
+  assert.ok(content.includes('- id: dshd-core\n  config:\n    stateDir: "/tmp/dsh-canary-a1/dshd-core"'), content)
+  // The smart-restart block stays FIRST (before the deepartments/dshd-core rows).
+  assert.ok(content.indexOf('- id: smart-restart') < content.indexOf('- id: dshd-core'), content)
+})
+
+test('fb-234 A1 (e2e): with a dshd-core override the ephemeral apply lands in the tmp overlay EVEN when spawned with the pre-fix cwd (the patch redirects the service-first stateDir) — LIVE store still untouched', async () => {
+  const { root, dshPath, liveStateDir, reportPath, liveFiles, liveSnapshot, envCleanup } = setupIsolationHarness()
+  try {
+    // The A1 map: deepartments:'' + dshd-core:'' (the profile line being added).
+    // Deliberately use the PRE-FIX spawn (cwd = the live parent dir): only the
+    // patch row protects — the ephemeral's service-first stateDir becomes the
+    // ABSOLUTE tmp path the patch emits, so the LIVE store survives even if
+    // the cwd fix were absent.
+    const preFixSpawn = (binary, profile, patchPath, port) => {
+      const argv = [binary]
+      if (profile) argv.push('--profile', profile)
+      argv.push('--patch', patchPath, '--port', String(port))
+      const child = spawn('setsid', argv, { detached: true, stdio: 'ignore', cwd: join(root, 'live') })
+      child.unref()
+      return child
+    }
+    const r = await runCanary(
+      undefined,
+      ISOLATION_CFG(dshPath, { deepartments: '', 'dshd-core': '' }),
+      {},
+      ISOLATION_HOOKS(liveStateDir, reportPath, preFixSpawn),
+    )
+    assert.equal(r.status, 'passed')
+    const eph = await waitForEphReport(reportPath)
+    // The patch redirected the dshd-core row into the ABSOLUTE tmp overlay.
+    assert.ok(eph.stateDir.startsWith(join(tmpdir(), 'dsh-canary-')), `A1 stateDir should be under the canary tmpDir, got ${eph.stateDir}`)
+    assert.ok(eph.stateDir.endsWith('/dshd-core'), `A1 stateDir should be the dshd-core overlay path, got ${eph.stateDir}`)
+    for (const f of liveFiles) {
+      assert.equal(readFileSync(join(liveStateDir, f), 'utf8'), liveSnapshot[f], `LIVE ${f} must be untouched by the A1-canary`)
+    }
+  } finally {
+    envCleanup()
+  }
 })
