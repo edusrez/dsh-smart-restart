@@ -113,7 +113,9 @@ Registered via `ctx.tools.register` in `apply` (so it is available to agent sess
 | -------- | ------ | -------- | ----------- |
 | `reason` | string | no       | Optional human-readable note, e.g. `"installed dshmarket in stable+dev"`. Included in the post-restart notice. |
 | `canary` | boolean | no      | Optional canary pre-restart validation for THIS call: boots an ephemeral DSH instance and aborts the restart on failure (see [Canary pre-restart validation](#canary-pre-restart-validation)). Overrides the configured `canary` for this call. |
-| `force` | boolean | no      | Explicit override of the [read-before-edit guard](#read-before-edit-guard): restart even when OTHER sessions are mid-turn. The tool refuses (and returns the in-flight session list) unless this is `true`; the override and the list are ALWAYS visible in the log. Use only after explicitly confirming the in-flight work is safe to interrupt. |
+| `force` | boolean | no      | Explicit override of the [read-before-edit guard](#read-before-edit-guard): restart even when OTHER sessions are mid-turn. The tool refuses (and returns the in-flight session list) unless this is `true`; the override and the list are ALWAYS visible in the log. Use only after explicitly confirming the in-flight work is safe to interrupt. WINS over `wait`: with `force: true` the tool never waits. |
+| `wait` | boolean | no      | DEFER the restart instead of refusing it: re-read the LIVE agent registry (the same in-process snapshot the guard uses — it sends no message and wakes nobody) until every OTHER session is idle, then restart. Bounded by `waitMaxMs`; once the cap is spent the tool returns the SAME loud in-flight refusal and states that the wait expired (nothing is spawned, nothing is persisted). |
+| `waitMaxMs` | number | no     | Hard cap in milliseconds on a `wait: true` deferral. Default `120000` (2 minutes); an absent or invalid value falls back to the default, so a wait is never unbounded. Ignored without `wait: true`. It caps the **whole** deferral: the wait at the guard AND, when a canary gate runs, its post-canary re-check draw from the same budget — the re-check gets only what is left and refuses immediately once nothing is left, so the deferral can never last 2x this cap (`waitedMs` reports the accumulated total). |
 
 **Behavior**
 
@@ -130,6 +132,8 @@ Since **v0.6.0**, `smart_restart` implements the **read-before-edit** pattern (f
 
 - If **any session other than the calling session** is mid-turn, the tool returns `{ok: false, restarting: false, error: 'refusing to restart: N other session(s) mid-turn (…)' , inFlight: [<ids>]}` — the caller is excluded because it restarts itself intentionally and is pinned for resume.
 - An explicit **`force: true`** is the only way through; the override and the in-flight list are **always written to the log** (`[smart-restart] smart_restart: FORCE override — restarting with N other session(s) mid-turn: …`).
+- Alternatively, **`wait: true`** inverts the refusal into a bounded deferral: the tool re-reads the SAME live registry snapshot in a sleep loop (default poll 1s) until every other session is idle, then restarts — it creates no turns and wakes nobody. The wait is capped by **`waitMaxMs`** (default 120000); at the cap the tool returns the same refusal with `waitTimedOut: true` and an `error` stating that the wait expired, so a spent wait is never confused with the immediate block. The deferral runs at the guard point, BEFORE the calling-session flush and BEFORE the canary gate, and `force: true` always wins.
+- **`waitMaxMs` is ONE budget for the whole deferral.** The canary window is exactly when a session starts a turn again (the window closes *while* it is being checked), so the post-canary re-check does not get a fresh cap: it runs the same `waitForIdle` with `max(0, waitMaxMs − spent)`, where `spent` is the deferral window since the wait opened (the guard-stage wait + the calling-session flush + the canary window). When nothing is left it refuses **immediately** with the spent total — never a zero-length wait. `waitedMs` in the result is the **accumulated** wait of both stages (guard + re-check), so the published figure is the real input of that arithmetic: either the restart happens, or there is a loud refusal — never a wait spent in silence.
 - The check runs at call entry **and again after a canary pass** (the canary window can be tens of seconds — the final gate reflects the current state, not the state at call entry).
 - A blind interruption is thus structurally impossible: the tool cannot spawn while other agents are running unless the caller explicitly confirms it.
 
@@ -361,12 +365,13 @@ Be honest about what this plugin does not do:
 ```
 src/
   index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool (incl. the read-before-edit active-agent guard (fb-168), the optional canary gate + abort alert, restartUnit auto-detection — resolveRestartUnit reads /proc/self/cgroup when config empty), delivery (followup/inject), interrupted-head resume notices (fb-168)
-  boot.ts    — pure, deterministic restart + notice logic (I/O-free, unit-testable), incl. parseShutdownNotice / shutdownTarget / activeAgentGuard / interruptedHeads
+  boot.ts    — pure, deterministic restart + notice logic (I/O-free, unit-testable), incl. parseShutdownNotice / shutdownTarget / activeAgentGuard / guardRefusalMessage / waitForIdle / interruptedHeads
   canary.ts  — optional canary pre-restart validation: ExecStart derivation, temp patch build, free-port pick, dump-config pre-flight, boot + liveness probe (all IO injectable via CanaryHooks)
 test/
   marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / activeAgentGuard / interruptedHeads / parseCgroupUnit / selectsAgent / targetsAgent / compiled exports
   notice.test.js  — buildNotice / humanizeDowntime
   canary.test.js  — deriveExecStartParams / buildPatchContent / pickFreePort / probeStatusHealthy / resolveExecTarget / runCanary with injected hooks
+  wait.test.js    — waitForIdle / guardRefusalMessage (scripted registry + virtual clock) + the smart_restart wait-path harness (fixtures/smart-restart-wait-topology.js)
 ```
 
 - `pnpm install` — install dependencies.

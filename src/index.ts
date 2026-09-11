@@ -36,7 +36,9 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
   activeAgentGuard,
   buildNotice,
+  DEFAULT_WAIT_MAX_MS,
   detectRestart,
+  guardRefusalMessage,
   ignoredByPrefix,
   interruptedHeads,
   parseCgroupUnit,
@@ -44,11 +46,13 @@ import {
   parseShutdownNotice,
   selectsAgent,
   shutdownTarget,
+  waitForIdle,
   type BootMarker,
   type ShutdownNotice,
   type ShutdownSession,
   type SmartRestartParams,
   type SmartRestartResult,
+  type WaitForIdleResult,
 } from './boot.js'
 import { DEFAULT_RUNTIME_STATE_DIR, runCanary, type CanaryResult } from './canary.js'
 // FB-234 — the INTENTIONAL-RESTART MARKER WRITER (see src/restart-reason.ts):
@@ -82,6 +86,19 @@ export interface SmartRestartCall extends SmartRestartParams {
    *  when OTHER sessions are mid-turn. Without it the tool refuses and returns
    *  the in-flight session list; the override is ALWAYS visible in the log. */
   force?: boolean
+  /** DEFER the restart instead of refusing it (the guard's `wait` counterpart,
+   *  fb-168-adjacent): re-read the LIVE agent registry until every OTHER
+   *  session is idle, then restart. `force` WINS — with `force:true` the wait
+   *  is never entered (an explicit override is never made to wait). Once
+   *  `waitMaxMs` is spent the tool returns the SAME loud in-flight refusal,
+   *  stating that the wait expired (no partial action, no half restart). */
+  wait?: boolean
+  /** Hard cap (ms) on a `wait:true` deferral; the declared default is
+   *  DEFAULT_WAIT_MAX_MS (120000). Ignored without `wait:true`. It caps the
+   *  WHOLE deferral: the guard-stage wait AND (after a canary gate) the final
+   *  re-check draw from the same budget, the re-check getting only what is
+   *  left — the total can never reach 2x the cap. */
+  waitMaxMs?: number
 }
 
 /** smart_restart result extended with the canary outcome. */
@@ -93,6 +110,14 @@ export interface SmartRestartOutcome extends SmartRestartResult {
   /** Other sessions that were mid-turn when a guard-blocked restart was
    *  refused (absent when the restart proceeded / nothing was in flight). */
   inFlight?: string[]
+  /** How long a `wait:true` deferral actually lasted (ms) — the ACCUMULATED
+   *  total of every wait stage of the call (the guard-stage deferral + the
+   *  post-canary re-check), never just the last one. Absent when no `wait` was
+   *  requested. FAILED waits carry it too (honest accounting). */
+  waitedMs?: number
+  /** Present + true ONLY on a `wait:true` deferral that spent its cap with
+   *  sessions still mid-turn (the refusal then says so in `error`). */
+  waitTimedOut?: boolean
 }
 
 export interface Config {
@@ -818,7 +843,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
       defineTool({
         name: 'smart_restart',
         description:
-          'Restart the DSH service via systemd and, after it comes back up, deliver the smart-restart notice to THIS session so the interrupted task resumes automatically. HARD GUARD: the tool reads the LIVE agent registry and REFUSES to restart while OTHER sessions are mid-turn (status running) — it returns the in-flight session list instead; pass force:true only after explicitly confirming that interrupting that work is safe (the override is always visible in the log). WARNING: restarting the service any other way (raw systemctl/reboot) while subagents/workers have active turns kills them mid-flight — their sessions end "Stopped" (turn reason: interrupted) and the tool result is "outcome unknown". Use this tool for any restart with live work; the canary param aborts on an unhealthy boot.',
+          'Restart the DSH service via systemd and, after it comes back up, deliver the smart-restart notice to THIS session so the interrupted task resumes automatically. HARD GUARD: the tool reads the LIVE agent registry and REFUSES to restart while OTHER sessions are mid-turn (status running) — it returns the in-flight session list instead; pass force:true only after explicitly confirming that interrupting that work is safe (the override is always visible in the log), or pass wait:true to DEFER the restart until the other sessions go idle (bounded by waitMaxMs, default 120000; a spent wait returns the same refusal saying it expired). WARNING: restarting the service any other way (raw systemctl/reboot) while subagents/workers have active turns kills them mid-flight — their sessions end "Stopped" (turn reason: interrupted) and the tool result is "outcome unknown". Use this tool for any restart with live work; the canary param aborts on an unhealthy boot.',
         parameters: {
           reason: {
             type: 'string',
@@ -838,7 +863,17 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           force: {
             type: 'boolean',
             description:
-              'Optional: override the read-before-edit guard — restart even when OTHER sessions are mid-turn. The tool refuses (returns the in-flight session list) unless this is true; the override and the in-flight list are ALWAYS logged. Use only after explicitly confirming the in-flight work is safe to interrupt.',
+              'Optional: override the read-before-edit guard — restart even when OTHER sessions are mid-turn. The tool refuses (returns the in-flight session list) unless this is true; the override and the in-flight list are ALWAYS logged. Use only after explicitly confirming the in-flight work is safe to interrupt. WINS over `wait`: with force:true the tool never waits.',
+          },
+          wait: {
+            type: 'boolean',
+            description:
+              'Optional: DEFER instead of refusing — re-read the LIVE agent registry (the same in-process snapshot the guard uses; it never sends a message or wakes anyone) until every OTHER session is idle, then restart. Bounded by `waitMaxMs`; when the cap is spent the tool returns the SAME loud in-flight refusal and states that the wait expired (no partial action, nothing is spawned). A canary gate shares that same budget (its post-canary re-check gets only the remaining time and refuses immediately once nothing is left), so a spent wait is never silent. `force:true` wins and skips the wait entirely.',
+          },
+          waitMaxMs: {
+            type: 'number',
+            description:
+              'Optional: hard cap in milliseconds on a `wait:true` deferral (default 120000 = 2 minutes). Ignored without `wait:true`; an absent/invalid value falls back to the default, so a wait never runs unbounded. It caps the WHOLE deferral: the `wait` at the guard AND, when a canary gate runs, its post-canary re-check draw from the same budget (the re-check gets only what is left; with nothing left it refuses immediately), and `waitedMs` reports the accumulated total — the deferral can never last 2x this cap.',
           },
         },
         output: {
@@ -854,6 +889,8 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
               canary: { type: 'string' },
               canaryDetail: { type: 'string' },
               inFlight: { type: 'array', items: { type: 'string' } },
+              waitedMs: { type: 'number' },
+              waitTimedOut: { type: 'boolean' },
             },
           },
           render: (_args, value) => {
@@ -867,6 +904,14 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
                 text: value.error
                   ? `smart_restart failed: ${value.error}`
                   : `Restarting the DSH service (session ${value.sessionId ?? '?'}) in ~1s; the notice will return to this session after it is back up.`,
+              })
+            }
+            // Only a SUCCESSFUL wait is worth a line: on a timeout the error
+            // line already states that the wait expired.
+            if (value.ok && value.waitedMs) {
+              lines.push({
+                type: 'text',
+                text: `Waited ${value.waitedMs}ms for the other session(s) to go idle before restarting.`,
               })
             }
             if (value.canary) {
@@ -898,9 +943,71 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           // restarts itself intentionally and is pinned for resume). Blind
           // interruption becomes structurally impossible; an explicit
           // force:true override is the only way through and is ALWAYS logged.
+          //
+          // fb-168 (adjacent) — `wait:true` INVERTS that refusal into a
+          // bounded deferral: instead of returning the refusal on the FIRST
+          // sight of a mid-turn session, the tool re-reads the SAME live
+          // registry snapshot in a sleep loop until every other session is
+          // idle, then lets the restart proceed. The wait runs HERE — before
+          // the calling-session flush, before the canary gate and before the
+          // post-canary re-check — so everything downstream reflects the
+          // POST-wait state. The wait is passive: it never creates a turn,
+          // never wakes anyone and touches no messaging surface.
+          //
+          // (B) — `waitMaxMs` is the budget of the WHOLE deferral, not of each
+          // wait stage: the guard-stage wait below AND the post-canary
+          // re-check draw from the SAME cap, and the re-check gets only
+          // `waitMaxMs - spent`. Without that, a wait that saw the registry
+          // idle and then burned its budget in the canary window would
+          // reproduce — inside the very tool that exists to kill it — the
+          // fb-677/fb-694 defect: the window closes WHILE it is being checked.
+          // Invariant: either the restart happens, or a LOUD refusal — never a
+          // wait silently spent.
           const force = args.force === true
-          const activeGuard = checkActiveGuard(ctx, guard.sessionId, force)
-          if (!activeGuard.ok) return activeGuard.result
+          const waitRequested = args.wait === true
+          // ONE live-registry reader for BOTH wait stages (same snapshot
+          // source, same passivity contract): `ctx.agents.list()` only — never
+          // a message, a wake, a queue or a turn.
+          const readLiveAgents = (): { id: unknown; status: string }[] =>
+            ctx.agents.list().map((a) => ({ id: a.id, status: a.status }))
+          let waited: WaitForIdleResult | undefined
+          /** The effective `waitMaxMs` of this call (0 when `wait` is not armed). */
+          let waitBudgetMs = 0
+          /** When the deferral window opened (the first wait). */
+          let waitBudgetStart = 0
+          if (waitRequested && force) {
+            console.warn('[smart-restart] smart_restart: wait ignored — force:true wins (no waiting)')
+          }
+          if (waitRequested && !force) {
+            waitBudgetMs = resolveWaitMaxMs(args.waitMaxMs)
+            waitBudgetStart = Date.now()
+            waited = await waitForIdle({
+              // The SAME registry snapshot the guard consumes (never a file, a
+              // queue or a cached dept_who view): ctx.agents is updated
+              // synchronously by the harness on every agent/status transition.
+              readAgents: readLiveAgents,
+              callingSessionId: guard.sessionId,
+              maxMs: waitBudgetMs,
+              sleep: sleepMs,
+              onLog: (line) => console.warn(`[smart-restart] smart_restart: ${line}`),
+            })
+            if (!waited.idle) {
+              // The cap is spent and sessions are still mid-turn: the SAME
+              // loud refusal as the immediate block, stating the expiry. No
+              // partial action and nothing spawned.
+              return {
+                ok: false,
+                restarting: false,
+                error: guardRefusalMessage(waited.inFlight, waited.waitedMs),
+                inFlight: waited.inFlight,
+                waitedMs: waited.waitedMs,
+                waitTimedOut: true,
+              }
+            }
+          } else {
+            const activeGuard = checkActiveGuard(ctx, guard.sessionId, force)
+            if (!activeGuard.ok) return activeGuard.result
+          }
           // RD #483 (b): durable checkpoint of the CALLING session before the
           // fire-and-forget spawn. The core's checkpoint policy already flushes
           // the session BEFORE the tool body (dsh-session-checkpoint-policy
@@ -924,11 +1031,15 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           // nothing is spawned, and the calling session is alerted live.
           if (args.canary ?? config.canary) {
             let canary: CanaryResult
+            /** Wall-clock ms the canary gate itself took (0 when it threw). */
+            let canaryWindowMs = 0
             try {
+              const canaryStart = Date.now()
               // The canary receives the EFFECTIVE unit ("already-resolved"):
               // it derives ExecStart from restartUnit, and an auto-detected
               // unit is zero-config here too.
               canary = await runCanary(ctx, { ...config, restartUnit: effectiveRestartUnit }, args as SmartRestartCall)
+              canaryWindowMs = Date.now() - canaryStart
             } catch (err) {
               canary = { status: 'failed', detail: `canary error: ${String(err)}` }
             }
@@ -947,20 +1058,97 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
             // live registry right before the spawn — a session may have started
             // a turn while the canary booted, and the final gate must reflect
             // the CURRENT state (never the check at call entry).
-            const recheck = checkActiveGuard(ctx, guard.sessionId, force)
-            if (!recheck.ok) {
-              console.warn('[smart-restart] smart_restart: active-agent guard re-check blocked the restart after the canary:', recheck.inFlight.join(', '))
-              return recheck.result
+            //
+            // (B) — the re-check runs on the REMAINING budget. The canary
+            // window consumes the SAME `waitMaxMs` budget: the re-check gets
+            // `max(0, waitMaxMs - spent)` and, when nothing is left, refuses
+            // IMMEDIATELY with the spent total instead of chaining a
+            // zero-length wait. `waitedMs` below accumulates BOTH stages, so
+            // the published figure is the real input of the arithmetic (the
+            // total deferral can never reach 2x the cap).
+            if (waited !== undefined) {
+              const spentMs = Date.now() - waitBudgetStart
+              const remainingMs = Math.max(0, waitBudgetMs - spentMs)
+              console.warn(
+                `[smart-restart] smart_restart: post-canary re-check: wait budget ${waitBudgetMs}ms — ` +
+                  `${Math.round(waited.waitedMs)}ms waited at the guard, ${canaryWindowMs}ms canary window, ` +
+                  `${Math.round(spentMs)}ms spent so far → ${Math.round(remainingMs)}ms left`,
+              )
+              if (remainingMs > 0) {
+                // The SAME `waitForIdle` (same reader, same caller exclusion,
+                // same passivity): only the cap differs — the remainder.
+                const reWaited = await waitForIdle({
+                  readAgents: readLiveAgents,
+                  callingSessionId: guard.sessionId,
+                  maxMs: remainingMs,
+                  sleep: sleepMs,
+                  onLog: (line) => console.warn(`[smart-restart] smart_restart: ${line}`),
+                })
+                if (!reWaited.idle) {
+                  // The budget is spent and sessions are still mid-turn: the
+                  // SAME loud refusal (in-flight list + the expiry sentence),
+                  // with the ACCUMULATED wait. No partial action, nothing
+                  // spawned, nothing persisted.
+                  const totalMs = waited.waitedMs + reWaited.waitedMs
+                  console.warn(
+                    `[smart-restart] smart_restart: BLOCKED at the post-canary re-check — ` +
+                      `${reWaited.inFlight.length} other session(s) mid-turn: ${reWaited.inFlight.join(', ')}; ` +
+                      `the wait budget (${waitBudgetMs}ms) is spent after ${Math.round(totalMs)}ms of waiting`,
+                  )
+                  return {
+                    ok: false,
+                    restarting: false,
+                    error: guardRefusalMessage(reWaited.inFlight, totalMs),
+                    inFlight: reWaited.inFlight,
+                    waitedMs: totalMs,
+                    waitTimedOut: true,
+                  }
+                }
+                // Honest accounting: the outcome carries the ACCUMULATED wait
+                // (guard stage + re-check), not just the last stage.
+                waited = { ...waited, waitedMs: waited.waitedMs + reWaited.waitedMs }
+              } else {
+                // Nothing left to wait with: decide on the CURRENT state
+                // immediately (never a zero-length wait).
+                const spentInFlight = activeAgentGuard(readLiveAgents(), guard.sessionId, false).inFlight
+                if (spentInFlight.length > 0) {
+                  console.warn(
+                    `[smart-restart] smart_restart: BLOCKED at the post-canary re-check — ` +
+                      `${spentInFlight.length} other session(s) mid-turn: ${spentInFlight.join(', ')}; ` +
+                      `the wait budget (${waitBudgetMs}ms) is spent (${Math.round(spentMs)}ms) with nothing left to wait with — ` +
+                      `refusing now (no zero-length wait)`,
+                  )
+                  return {
+                    ok: false,
+                    restarting: false,
+                    error: guardRefusalMessage(spentInFlight, waited.waitedMs),
+                    inFlight: spentInFlight,
+                    waitedMs: waited.waitedMs,
+                    waitTimedOut: true,
+                  }
+                }
+              }
+            } else {
+              const recheck = checkActiveGuard(ctx, guard.sessionId, force)
+              if (!recheck.ok) {
+                console.warn('[smart-restart] smart_restart: active-agent guard re-check blocked the restart after the canary:', recheck.inFlight.join(', '))
+                return recheck.result
+              }
             }
             // passed / skipped → proceed with the normal restart and carry the
             // canary outcome onto the result. The canary gate RAN: without an
             // explicit cause this is a CANARY restart (GRACE family 'canary').
-            return performRestart(args, exec, markerDir, effectiveRestartUnit, {
+            // A successful `wait` carries how long it deferred onto the result.
+            const canaryOutcome = await performRestart(args, exec, markerDir, effectiveRestartUnit, {
               runtimeStateDir,
               canary: { status: canary.status, detail: canary.detail },
             })
+            if (waited && waited.waitedMs > 0) canaryOutcome.waitedMs = waited.waitedMs
+            return canaryOutcome
           }
-          return performRestart(args, exec, markerDir, effectiveRestartUnit, { runtimeStateDir })
+          const outcome = await performRestart(args, exec, markerDir, effectiveRestartUnit, { runtimeStateDir })
+          if (waited && waited.waitedMs > 0) outcome.waitedMs = waited.waitedMs
+          return outcome
         },
       }),
     )
@@ -1053,10 +1241,38 @@ function checkActiveGuard(
     result: {
       ok: false,
       restarting: false,
-      error: `refusing to restart: ${g.inFlight.length} other session(s) mid-turn (${g.inFlight.join(', ')}) — pass force:true to override`,
+      // Byte-identical to the pre-`wait` refusal (guardRefusalMessage with no
+      // waitedMs): the `wait` parameter is purely additive.
+      error: guardRefusalMessage(g.inFlight),
       inFlight: g.inFlight,
     },
   }
+}
+
+/**
+ * Resolve the effective `waitMaxMs` cap of a `wait:true` deferral.
+ *
+ * Absent → the declared default (2 minutes). A value that is not a finite
+ * non-negative number is a caller error and falls back to the default with a
+ * loud log — a `wait` must never be unbounded by accident.
+ */
+function resolveWaitMaxMs(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_WAIT_MAX_MS
+  if (!Number.isFinite(value) || value < 0) {
+    console.warn(
+      `[smart-restart] smart_restart: invalid waitMaxMs (${String(value)}); using the default ${DEFAULT_WAIT_MAX_MS}ms`,
+    )
+    return DEFAULT_WAIT_MAX_MS
+  }
+  return value
+}
+
+/**
+ * The real sleep of the `wait` loop. Injected into the pure `waitForIdle` so
+ * boot.ts stays IO-free and its timing is unit-testable without timers.
+ */
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /** Restart the DSH systemd unit and pin the notice to the calling session.

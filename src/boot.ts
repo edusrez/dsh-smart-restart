@@ -371,6 +371,133 @@ export function activeAgentGuard(
 }
 
 /**
+ * The tool's LOUD refusal message for a guard-blocked restart.
+ *
+ * Without `waitedMs` this is byte-for-byte the pre-`wait` (fb-168) refusal:
+ * same wording, same in-flight list, same override hint — the `wait` parameter
+ * is purely additive. With a `waitedMs` value (a `wait` that ran out) the SAME
+ * refusal is returned with an explicit expiry sentence, so a timeout is never
+ * mistakable for the immediate block.
+ */
+export function guardRefusalMessage(inFlight: readonly string[], waitedMs?: number): string {
+  const base = `refusing to restart: ${inFlight.length} other session(s) mid-turn (${inFlight.join(', ')})`;
+  if (waitedMs === undefined) return `${base} — pass force:true to override`;
+  return `${base} — the wait expired after ${Math.round(waitedMs)}ms with those session(s) still mid-turn; pass force:true to override`;
+}
+
+/** Default cap (ms) on how long a `wait` restart defers to OTHER sessions
+ *  (2 minutes): the tool re-reads the LIVE registry until the architecture is
+ *  idle, and refuses with the usual loud in-flight rejection once the cap is
+ *  reached. A declared default keeps `wait:true` from ever waiting forever. */
+export const DEFAULT_WAIT_MAX_MS = 120_000;
+
+/** How often the `wait` loop re-reads the live registry (ms). */
+export const WAIT_POLL_MS = 1_000;
+
+/** Outcome of a bounded wait for the live registry to go idle (waitForIdle). */
+export interface WaitForIdleResult {
+  /** true → no OTHER session is mid-turn: the restart may proceed NOW. */
+  idle: boolean;
+  /** Sessions still mid-turn when the wait ENDED (empty once idle). */
+  inFlight: string[];
+  /** Wall-clock ms the wait actually lasted (0 when nothing had to be waited). */
+  waitedMs: number;
+  /** true → the cap (`maxMs`) was reached with sessions still mid-turn. */
+  timedOut: boolean;
+  /** Registry re-reads performed while waiting (0 = the registry was idle). */
+  polls: number;
+  /** Sessions mid-turn when the wait STARTED — who it waited on (the honest
+   *  "released" reference in the end log). Empty when nothing was in flight. */
+  waitedOn: string[];
+}
+
+export interface WaitForIdleOptions {
+  /** Read the LIVE in-process agent registry — the SAME snapshot the guard
+   *  consumes (`ctx.agents.list()` in the plugin). MUST be organization-side
+   *  effect free: the wait only re-reads this snapshot, it NEVER sends a
+   *  message, wakes a session, or touches any queue/messaging surface. */
+  readAgents: () => readonly ActiveAgentView[];
+  /** The session that requested the restart — always excluded from the wait
+   *  (it must never wait on its own in-flight turn). */
+  callingSessionId: string;
+  /** Hard cap on the wait (ms); 0 or a non-finite value → no waiting at all. */
+  maxMs: number;
+  /** ms between polls (default WAIT_POLL_MS); the loop never oversleeps the cap. */
+  pollMs?: number;
+  /** Clock used for the elapsed measurement (default Date.now). */
+  now?: () => number;
+  /** Injected sleep — keeps this module IO-free (the plugin passes a real
+   *  setTimeout promise, tests pass a deterministic fake). */
+  sleep: (ms: number) => Promise<void>;
+  /** Injected observer for the honest wait log: start, end, how long it waited
+   *  and what closed it (who went idle / who was still mid-turn at the cap). */
+  onLog?: (line: string) => void;
+}
+
+/**
+ * Wait (bounded) for the LIVE agent registry to become IDLE, then let the
+ * restart proceed — the `wait` counterpart of the fb-168 read-before-edit
+ * guard. Instead of refusing on the FIRST sight of a mid-turn session, the
+ * caller defers its restart until every OTHER session has finished its turn,
+ * and refuses with the very same loud in-flight rejection once `maxMs` is
+ * spent (`idle:false, timedOut:true` — NO partial action, the caller decides).
+ *
+ * The calling session is always excluded (pure `activeAgentGuard` semantics),
+ * so the wait can never deadlock on the caller's own in-flight turn. The wait
+ * is PASSIVE by construction: its only interaction with the harness is
+ * re-reading the injected registry snapshot between sleeps — it creates no
+ * turns and wakes nobody.
+ */
+export async function waitForIdle(opts: WaitForIdleOptions): Promise<WaitForIdleResult> {
+  const now = opts.now ?? Date.now;
+  const maxMs = Number.isFinite(opts.maxMs) && opts.maxMs > 0 ? opts.maxMs : 0;
+  const pollMs = opts.pollMs !== undefined && Number.isFinite(opts.pollMs) && opts.pollMs > 0
+    ? opts.pollMs
+    : WAIT_POLL_MS;
+  const log = opts.onLog ?? (() => {});
+
+  const readInFlight = (): string[] =>
+    activeAgentGuard(opts.readAgents(), opts.callingSessionId, false).inFlight;
+
+  const waitedOn = readInFlight();
+  if (waitedOn.length === 0) {
+    log('wait: registry already IDLE (0 other sessions mid-turn) — no wait needed');
+    return { idle: true, inFlight: [], waitedMs: 0, timedOut: false, polls: 0, waitedOn: [] };
+  }
+
+  const start = now();
+  log(
+    `wait start: ${waitedOn.length} other session(s) mid-turn (${waitedOn.join(', ')}) — ` +
+      `waiting up to ${maxMs}ms for the registry to go idle (poll ${pollMs}ms)`,
+  );
+
+  let inFlight = waitedOn;
+  let polls = 0;
+  for (;;) {
+    const elapsed = now() - start;
+    if (elapsed >= maxMs) break;
+    await opts.sleep(Math.min(pollMs, maxMs - elapsed));
+    polls += 1;
+    inFlight = readInFlight();
+    if (inFlight.length === 0) {
+      const waitedMs = now() - start;
+      log(
+        `wait end: registry IDLE after ${waitedMs}ms (${polls} poll(s)) — ` +
+          `released: ${waitedOn.join(', ')}; proceeding with the restart`,
+      );
+      return { idle: true, inFlight: [], waitedMs, timedOut: false, polls, waitedOn };
+    }
+  }
+
+  const waitedMs = now() - start;
+  log(
+    `wait end: TIMEOUT after ${waitedMs}ms (${polls} poll(s)) — still mid-turn: ` +
+      `${inFlight.join(', ')}; refusing the restart with the in-flight rejection`,
+  );
+  return { idle: false, inFlight, waitedMs, timedOut: true, polls, waitedOn };
+}
+
+/**
  * fb-168 (b) — the automatic resume-notify recipients of a shutdown notice.
  *
  * The sessions of the interrupted list that match the ignored prefixes
