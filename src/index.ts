@@ -873,7 +873,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           waitMaxMs: {
             type: 'number',
             description:
-              'Optional: hard cap in milliseconds on a `wait:true` deferral (default 120000 = 2 minutes). Ignored without `wait:true`; an absent/invalid value falls back to the default, so a wait never runs unbounded. It caps the WHOLE deferral: the `wait` at the guard AND, when a canary gate runs, its post-canary re-check draw from the same budget (the re-check gets only what is left; with nothing left it refuses immediately), and `waitedMs` reports the accumulated total — the deferral can never last 2x this cap.',
+              'Optional: hard cap in milliseconds on a `wait:true` deferral (default 120000 = 2 minutes). Ignored without `wait:true`; an absent/invalid value falls back to the default, so a wait never runs unbounded. An explicit 0 (or a value <= 0) is NOT the default: it spends no budget, so a restart blocked by another mid-turn session refuses IMMEDIATELY — the same loud in-flight refusal, reporting only the few ms that elapsed (never 120000) — use a positive cap for a short deferral. It caps the WHOLE deferral: the `wait` at the guard AND, when a canary gate runs, its post-canary re-check draw from the same budget (the re-check gets only what is left; with nothing left it refuses immediately), and `waitedMs` reports the accumulated total — the deferral can never last 2x this cap.',
           },
         },
         output: {

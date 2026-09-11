@@ -271,6 +271,83 @@ test('waitForIdle: the registry is re-read EVERY poll — a session that starts 
   assert.equal(res.waitedMs, 3 * WAIT_POLL_MS)
 })
 
+// --- the INVERSE edge: TWO callers waiting on EACH OTHER (mutual) -------------
+//
+// `activeAgentGuard` excludes the CALLING session only, so with A and B both
+// mid-turn each caller's OWN turn never makes it wait for itself while the
+// OTHER's does — the per-caller exclusion is exactly what turns a would-be
+// symmetric deadlock into a cap-bounded livelock. Deterministic here (scripted
+// registry + one virtual clock per waiter); the live end-to-end measurement of
+// the same edge is the harness scenario 11 (two concurrent `execute`).
+
+test('waitForIdle: TWO callers waiting on each other BOTH expire at the cap — bounded livelock, never deadlock', async () => {
+  // A registry that NEVER releases: both callers are the other one's blocker.
+  const reg = simulatedRegistry([[RUNNING('head-A'), RUNNING('head-B')]])
+  const clockA = virtualClock()
+  const clockB = virtualClock()
+  const [a, b] = await Promise.all([
+    waitForIdle({ readAgents: reg.read, callingSessionId: 'head-A', maxMs: 2_000, sleep: clockA.sleep, now: clockA.now }),
+    waitForIdle({ readAgents: reg.read, callingSessionId: 'head-B', maxMs: 2_000, sleep: clockB.sleep, now: clockB.now }),
+  ])
+  assert.equal(a.timedOut, true)
+  assert.equal(b.timedOut, true)
+  assert.equal(a.idle, false)
+  assert.equal(b.idle, false)
+  assert.deepEqual(a.inFlight, ['head-B'], 'A never lists its OWN turn')
+  assert.deepEqual(b.inFlight, ['head-A'], 'B never lists its OWN turn')
+  assert.deepEqual(a.waitedOn, ['head-B'])
+  assert.deepEqual(b.waitedOn, ['head-A'])
+  assert.equal(a.waitedMs, 2_000, 'the cap is a HARD bound: the mutual wait cannot spin forever')
+  assert.equal(b.waitedMs, 2_000)
+  assert.deepEqual(clockA.slept, [WAIT_POLL_MS, WAIT_POLL_MS])
+  assert.deepEqual(clockB.slept, [WAIT_POLL_MS, WAIT_POLL_MS])
+  // The SAME loud refusal on both sides, each naming the OTHER — never a silent
+  // wait, never a partial action.
+  assert.equal(
+    guardRefusalMessage(a.inFlight, a.waitedMs),
+    'refusing to restart: 1 other session(s) mid-turn (head-B) — the wait expired after 2000ms with those session(s) still mid-turn; pass force:true to override',
+  )
+  assert.equal(
+    guardRefusalMessage(b.inFlight, b.waitedMs),
+    'refusing to restart: 1 other session(s) mid-turn (head-A) — the wait expired after 2000ms with those session(s) still mid-turn; pass force:true to override',
+  )
+})
+
+test('waitForIdle: the PEER closing releases this waiter — the mutual edge is asymmetric, not a deadlock', async () => {
+  // A's reader: the peer is mid-turn for the entry read + poll 1, then closes.
+  let readsA = 0
+  const readA = () => {
+    readsA += 1
+    return readsA <= 2
+      ? [RUNNING('head-A'), RUNNING('head-B')]
+      : [RUNNING('head-A'), idle('head-B')]
+  }
+  // B's reader: B waits on A with a SHORT cap and gives up (its turn ends).
+  const readB = () => [RUNNING('head-A'), RUNNING('head-B')]
+  const clockA = virtualClock()
+  const clockB = virtualClock()
+  const [a, b] = await Promise.all([
+    waitForIdle({ readAgents: readA, callingSessionId: 'head-A', maxMs: 5_000, sleep: clockA.sleep, now: clockA.now }),
+    waitForIdle({ readAgents: readB, callingSessionId: 'head-B', maxMs: 400, sleep: clockB.sleep, now: clockB.now }),
+  ])
+  // A is RELEASED by B going idle: it proceeds, and its waitedMs is the real
+  // elapsed deferral (the poll that saw the release), never the cap.
+  assert.equal(a.idle, true)
+  assert.equal(a.timedOut, false)
+  assert.deepEqual(a.inFlight, [])
+  assert.deepEqual(a.waitedOn, ['head-B'])
+  assert.equal(a.polls, 2)
+  assert.equal(a.waitedMs, 2 * WAIT_POLL_MS)
+  assert.ok(a.waitedMs < 5_000, 'the release unblocks A well before the cap')
+  // B, whose own cap is spent while A is still mid-turn, refuses with the
+  // expiry refusal naming A — the two sides do NOT deadlock on each other.
+  assert.equal(b.idle, false)
+  assert.equal(b.timedOut, true)
+  assert.deepEqual(b.inFlight, ['head-A'])
+  assert.equal(b.waitedMs, 400)
+  assert.deepEqual(clockB.slept, [400])
+})
+
 // --- the tool end to end (real plugin boot, simulated registry) ---------------
 
 test('harness: the smart_restart wait paths against a SIMULATED live registry', { timeout: 90_000 }, async () => {
@@ -332,4 +409,77 @@ test('harness: the smart_restart wait paths against a SIMULATED live registry', 
   assert.match(stderr, /post-canary re-check: wait budget \d+ms — \d+ms waited at the guard, \d+ms canary window, \d+ms spent so far → \d+ms left/)
   assert.match(stderr, /BLOCKED at the post-canary re-check/)
   assert.match(stderr, /refusing now \(no zero-length wait\)/)
+  // (a1)-(a4) — the INVERSE edge: TWO concurrent callers on ONE shared registry
+  // (each with its own `exec.agent.id`), so each one's own turn is excluded from
+  // its own guard while it still counts for the other.
+  assert.match(stdout, /SCEN:two-waiters-mutual-both-refuse:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-mutual-same-loud-expiry:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-mutual-other-only-in-flight:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-mutual-both-flagged-expired:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-mutual-both-waited-concurrently:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-mutual-no-spawn:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-mutual-no-partial-action:PASS/)
+  // (a3) passivity at the edge — invocation counters, not a text scan.
+  assert.match(stdout, /SCEN:two-waiters-passive-only-list:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-passive-no-messaging-no-wake-no-flush:PASS/)
+  // (a2) one waits, the other closes → the release UNBLOCKS (kill happens).
+  assert.match(stdout, /SCEN:two-waiters-release-B-expires-naming-A:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-release-A-restarts:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-release-A-waited-real-time:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-release-spawn:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-release-notice-anchored:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-release-log-names-the-released-peer:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-release-passive:PASS/)
+  // (a4) the escape hatch is never queued behind other waiters.
+  assert.match(stdout, /SCEN:two-waiters-force-escapes-immediately:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-force-is-immediate:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-force-spawn:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-force-notice-anchored:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-force-leaves-both-waiters-expiring:PASS/)
+  assert.match(stdout, /SCEN:two-waiters-force-passive:PASS/)
+  // The printed counters of the MUTUAL edge: the two waiters touched ONLY
+  // `agents.list()` — zero `agents.get`/`agents.roots`, zero session surface,
+  // zero messaging/wake — and spawned nothing.
+  const mutual =
+    /WAITERS:mutual cap=(\d+)ms wall=(\d+)ms A\(waitedMs=(\d+),inFlight=\["head-test-waiter-B"\]\) B\(waitedMs=(\d+),inFlight=\["head-test-waiter-A"\]\) A-blames=head-test-waiter-B B-blames=head-test-waiter-A list=(\d+) agents-get\/roots=(\d+) sessions=(\d+) messaging=(\d+) kills=(\d+)/.exec(
+      stdout,
+    )
+  assert.ok(mutual, `the mutual WAITERS counter line is missing from:\n${stdout}`)
+  const [, capMut, wallMut, waitedMutA, waitedMutB, listMut, getRootsMut, sessionsMut, messagingMut, killsMut] = mutual.map(Number)
+  assert.ok(wallMut >= capMut, `the two waits must be CONCURRENT (wall ${wallMut}ms for cap ${capMut}ms)`)
+  assert.ok(waitedMutA >= capMut - 50 && waitedMutB >= capMut - 50, 'BOTH waiters really waited out the cap (no immediate refusal, no deadlock)')
+  assert.ok(listMut >= 4, `each waiter reads the registry at least twice (entry + poll), got ${listMut} reads`)
+  assert.equal(getRootsMut, 0, 'the wait must never touch agents.get / agents.roots')
+  assert.equal(sessionsMut, 0, 'a refused mutual wait must not touch (or flush) any session')
+  assert.equal(messagingMut, 0, 'a refused mutual wait must not message or wake anyone')
+  assert.equal(killsMut, 0, 'a mutual expiry must spawn nothing')
+  // The release counters: exactly ONE kill (A), same passivity, waitedMs real.
+  const release =
+    /WAITERS:release A_cap=(\d+)ms B_cap=(\d+)ms wall=(\d+)ms A\(ok=true,waitedMs=(\d+)\) B\(ok=false,waitTimedOut=true,inFlight=\["head-test-waiter-A"\]\) list=\d+ agents-get\/roots=(\d+) messaging=(\d+) kills=(\d+)/.exec(
+      stdout,
+    )
+  assert.ok(release, `the release WAITERS counter line is missing from:\n${stdout}`)
+  const [, aCapRel, bCapRel, wallRel, waitedRel, getRootsRel, messagingRel, killsRel] = release.map(Number)
+  assert.equal(getRootsRel, 0, 'the release path must touch agents.list() only')
+  assert.equal(messagingRel, 0, 'the release path must not message or wake anyone')
+  assert.equal(killsRel, 1, 'the release of the peer must let A restart EXACTLY once')
+  assert.ok(waitedRel > bCapRel, `A proceeds AFTER B's short-cap expiry released it (${waitedRel}ms > ${bCapRel}ms)`)
+  assert.ok(waitedRel < aCapRel, `A is unblocked well before its own cap (${waitedRel}ms < ${aCapRel}ms)`)
+  assert.ok(waitedRel <= wallRel, 'waitedMs is part of the measured wall window (a real elapsed time)')
+  // The VERBATIM refusal of each side of the mutual edge — the same loud
+  // rejection, each naming the OTHER session (self is never listed).
+  assert.match(
+    stdout,
+    /WAITERS:mutual-refusals A="refusing to restart: 1 other session\(s\) mid-turn \(head-test-waiter-B\) — the wait expired after \d+ms with those session\(s\) still mid-turn; pass force:true to override" B="refusing to restart: 1 other session\(s\) mid-turn \(head-test-waiter-A\) — the wait expired after \d+ms with those session\(s\) still mid-turn; pass force:true to override"/,
+  )
+  assert.match(
+    stdout,
+    /WAITERS:release-refusal B="refusing to restart: 1 other session\(s\) mid-turn \(head-test-waiter-A\) — the wait expired after \d+ms with those session\(s\) still mid-turn; pass force:true to override"/,
+  )
+  // The SAME loud expiry refusal, verbatim, on BOTH sides of the mutual edge,
+  // and the escape hatch landing inside the two waits.
+  assert.match(stderr, /wait end: TIMEOUT after \d+ms \(\d+ poll\(s\)\) — still mid-turn: head-test-waiter-A; refusing the restart with the in-flight rejection/)
+  assert.match(stderr, /wait end: TIMEOUT after \d+ms \(\d+ poll\(s\)\) — still mid-turn: head-test-waiter-B; refusing the restart with the in-flight rejection/)
+  assert.match(stderr, /wait end: registry IDLE after \d+ms \(\d+ poll\(s\)\) — released: head-test-waiter-B; proceeding with the restart/)
+  assert.match(stderr, /FORCE override — restarting with 2 other session\(s\) mid-turn: head-test-waiter-A, head-test-waiter-B/)
 })

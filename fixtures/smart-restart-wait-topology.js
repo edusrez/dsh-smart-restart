@@ -39,6 +39,20 @@
 // 10. TRAMO (B) — the budget is spent but the registry is IDLE at the
 //     re-check → the restart proceeds (no wait, no refusal: the decision is
 //     the CURRENT state, never the clock).
+// 11. (a1) TWO WAITERS, MUTUAL: TWO `execute` calls CONCURRENTLY on ONE shared
+//     `ctx.agents` (distinct `exec.agent.id`: A and B), both `wait:true` with a
+//     SHORT cap, A and B BOTH `running` in the snapshot → each waits on the
+//     OTHER (its own turn is excluded from its own guard) and BOTH expire with
+//     the SAME loud refusal, 0 kills, no partial action: the measured proof of
+//     "bounded livelock, never deadlock".
+// 12. (a2) ONE WAITS, THE OTHER CLOSES: A defers with a long cap while B (a
+//     concurrent caller) expires on a short one and its turn ENDS there (the
+//     registry flips B to idle) → the release UNBLOCKS A: kill happens,
+//     `waitedMs` reflects the real elapsed time (no symmetric deadlock).
+// 13. (a4) DERIVED — the ESCAPE HATCH during a mutual wait: a THIRD caller with
+//     `force:true` restarts IMMEDIATELY while A and B are both stuck waiting
+//     (and both still expire afterwards): the `force` override is never
+//     blocked by other waiters.
 //
 // The canary of scenarios 7-9 is REAL code (runCanary + its client-graph
 // check) against a FAKE `dsh` binary on PATH: `--dump-config` prints a
@@ -149,12 +163,38 @@ process.env.PATH = `${fakeBin}${process.env.PATH ? `:${process.env.PATH}` : ''}`
 // --- SIMULATED live registry --------------------------------------------------
 
 const CALLER = 'head-test-caller'
-const running = (id) => ({ id, status: 'running' })
-const idle = (id) => ({ id, status: 'idle' })
+// Three INDEPENDENT callers for the inverse edge (scenarios 11-13): distinct
+// `exec.agent.id`s over ONE SHARED `ctx.agents` snapshot, so each caller's own
+// turn is excluded from its OWN guard check while it still counts for the other.
+const WAITER_A = 'head-test-waiter-A'
+const WAITER_B = 'head-test-waiter-B'
+const FORCER_C = 'head-test-forcer-C'
 
 let snapshot = []
 let listCalls = 0
 let otherAgentCalls = []
+// PASSIVITY AT THE EDGE: the messaging handles of every listed agent are SPIES,
+// and the session flush surface is instrumented — both are INVOCATION recorders
+// (never a source/text scan), so "zero messaging / zero wakes / no flush" is a
+// count of things actually CALLED, not of strings in this file.
+let messagingCalls = []
+let sessionsCalls = []
+
+/** One agent as the live registry exposes it: the guard reads `id`/`status`;
+ *  `followup`/`inject` (wake + delivery) are recorded if anything ever calls
+ *  them on a LISTED handle. */
+const agentHandle = (id, status) => ({
+  id,
+  status,
+  followup: () => {
+    messagingCalls.push(`followup:${id}`)
+  },
+  inject: () => {
+    messagingCalls.push(`inject:${id}`)
+  },
+})
+const running = (id) => agentHandle(id, 'running')
+const idle = (id) => agentHandle(id, 'idle')
 
 /** Install the script for the NEXT execute: successive `list()` reads return
  *  successive entries and the LAST repeats forever. */
@@ -162,11 +202,26 @@ function script(snapshots) {
   let reads = 0
   listCalls = 0
   otherAgentCalls = []
+  messagingCalls = []
+  sessionsCalls = []
   snapshot = snapshots
   return () => {
     const snap = snapshots[Math.min(reads, snapshots.length - 1)]
     reads += 1
     return snap
+  }
+}
+
+/** A SHARED MUTABLE live registry for TWO CONCURRENT callers: every `list()`
+ *  returns the CURRENT state, so a status flip mid-wait (or a second caller
+ *  running its own `execute`) is observed by the OTHER caller's next poll. */
+function liveRegistry(entries) {
+  const state = new Map(entries)
+  return {
+    set: (id, status) => {
+      state.set(id, status)
+    },
+    reader: () => [...state].map(([id, status]) => agentHandle(id, status)),
   }
 }
 
@@ -197,7 +252,15 @@ const ctx = {
       return currentReader()
     },
   },
-  sessions: { get: () => undefined, flush: async () => {} },
+  sessions: {
+    get: (id) => {
+      sessionsCalls.push(`get:${String(id)}`)
+      return undefined
+    },
+    flush: async (session) => {
+      sessionsCalls.push(`flush:${session === undefined ? 'undefined' : 'session'}`)
+    },
+  },
 }
 let capturedTool = null
 
@@ -592,6 +655,237 @@ const FB168_REFUSAL =
     `waitedMs=${res.waitedMs} guard=${recheck?.waited} cap=${CAP}`,
   )
   check('canary-spent-idle-passive', listCalls === 4 && otherAgentCalls.length === 0, `${listCalls} list / ${otherAgentCalls.join(',')}`)
+}
+
+// --- 11. (a1) TWO WAITERS, MUTUAL — the INVERSE edge: A and B are BOTH mid-turn
+//         and BOTH wait: each defers on the other. The guard is per CALLING
+//         SESSION (`activeAgentGuard`: `String(a.id) !== callingSessionId`), so
+//         a caller's OWN turn never waits for itself — but it IS the other
+//         caller's in-flight entry. Prediction: bounded livelock (both expire at
+//         the cap with the SAME loud refusal), NEVER a deadlock. Measured here
+//         with TWO concurrent executes over ONE shared registry. -------------
+{
+  const CAP = 400
+  const reg = liveRegistry([
+    [WAITER_A, 'running'],
+    [WAITER_B, 'running'],
+  ])
+  currentReader = reg.reader
+  listCalls = 0
+  otherAgentCalls = []
+  messagingCalls = []
+  sessionsCalls = []
+  const killsBefore = killLines().length
+  const pendingBefore = JSON.stringify(pending())
+  const markerBefore = JSON.stringify(marker())
+  warnLines.length = 0
+  const t0 = Date.now()
+  // BOTH started in the same tick (each `execute` runs synchronously to its
+  // first await), so both ENTRY reads see A AND B running: the genuinely mutual
+  // edge — neither caller's check can see an idle registry.
+  const [resA, resB] = await Promise.all([
+    capturedTool.execute({ wait: true, waitMaxMs: CAP }, { agent: { id: WAITER_A } }),
+    capturedTool.execute({ wait: true, waitMaxMs: CAP }, { agent: { id: WAITER_B } }),
+  ])
+  const windowMs = elapsedSince(t0)
+  await settle()
+  const killsAfter = killLines().length
+  const EXPIRY_RE =
+    /^refusing to restart: 1 other session\(s\) mid-turn \((head-test-waiter-[AB])\) — the wait expired after (\d+)ms with those session\(s\) still mid-turn; pass force:true to override$/
+  const matchA = EXPIRY_RE.exec(String(resA.error))
+  const matchB = EXPIRY_RE.exec(String(resB.error))
+  console.log(
+    `WAITERS:mutual cap=${CAP}ms wall=${windowMs}ms ` +
+      `A(waitedMs=${resA.waitedMs},inFlight=${JSON.stringify(resA.inFlight)}) ` +
+      `B(waitedMs=${resB.waitedMs},inFlight=${JSON.stringify(resB.inFlight)}) ` +
+      `A-blames=${matchA?.[1]} B-blames=${matchB?.[1]} ` +
+      `list=${listCalls} agents-get/roots=${otherAgentCalls.length} sessions=${sessionsCalls.length} messaging=${messagingCalls.length} ` +
+      `kills=${killsAfter - killsBefore}\n` +
+      `WAITERS:mutual-refusals A="${String(resA.error)}" B="${String(resB.error)}"`,
+  )
+  check(
+    'two-waiters-mutual-both-refuse',
+    resA.ok === false && resA.restarting === false && resB.ok === false && resB.restarting === false,
+    `A=${JSON.stringify(resA)} B=${JSON.stringify(resB)}`,
+  )
+  // THE HEADLINE (a1): the SAME rejection on BOTH sides, each naming the OTHER —
+  // no deadlock, no silent wait, no partial restart.
+  check(
+    'two-waiters-mutual-same-loud-expiry',
+    matchA !== null && matchB !== null && matchA[1] === WAITER_B && matchB[1] === WAITER_A,
+    `A="${String(resA.error)}" | B="${String(resB.error)}"`,
+  )
+  check(
+    'two-waiters-mutual-other-only-in-flight',
+    JSON.stringify(resA.inFlight) === JSON.stringify([WAITER_B]) && JSON.stringify(resB.inFlight) === JSON.stringify([WAITER_A]),
+    `A=${JSON.stringify(resA.inFlight)} B=${JSON.stringify(resB.inFlight)} (a caller NEVER lists its own turn)`,
+  )
+  check(
+    'two-waiters-mutual-both-flagged-expired',
+    resA.waitTimedOut === true &&
+      resB.waitTimedOut === true &&
+      typeof resA.waitedMs === 'number' &&
+      typeof resB.waitedMs === 'number' &&
+      resA.waitedMs >= CAP - 50 &&
+      resB.waitedMs >= CAP - 50,
+    `A=${JSON.stringify(resA)} B=${JSON.stringify(resB)}`,
+  )
+  check(
+    'two-waiters-mutual-both-waited-concurrently',
+    windowMs >= CAP && windowMs < CAP * 4,
+    `wall ${windowMs}ms for cap ${CAP}ms (a serialized or immediate refusal would be far below the cap)`,
+  )
+  check('two-waiters-mutual-no-spawn', killsAfter === killsBefore, `kills ${killsAfter} (before ${killsBefore})`)
+  check(
+    'two-waiters-mutual-no-partial-action',
+    JSON.stringify(pending()) === pendingBefore && JSON.stringify(marker()) === markerBefore,
+    'a mutual expiry must persist nothing (no pending notice, no marker)',
+  )
+  // (a3) PASSIVITY AT THE EDGE — invocation counters, not a text/source scan:
+  // the ONLY surface either caller touched is `ctx.agents.list()`.
+  check(
+    'two-waiters-passive-only-list',
+    listCalls >= 4 && listCalls <= 6 && otherAgentCalls.length === 0,
+    `${listCalls} list() (2 entry reads + 1 poll each) / agents.get|roots: ${otherAgentCalls.join(',') || 'none'}`,
+  )
+  check(
+    'two-waiters-passive-no-messaging-no-wake-no-flush',
+    messagingCalls.length === 0 && sessionsCalls.length === 0,
+    `messaging [${messagingCalls.join(',')}] sessions [${sessionsCalls.join(',')}]`,
+  )
+}
+
+// --- 12. (a2) ONE WAITS, THE OTHER CLOSES — the release is not symmetric: B
+//         defers on a SHORT cap and gives up (its turn ENDS there: the registry
+//         flips B to idle when B's execute settles), which is what UNBLOCKS A.
+//         A really restarts and its `waitedMs` reflects the real elapsed time.
+{
+  const A_CAP = 5_000
+  const B_CAP = 400
+  const reg = liveRegistry([
+    [WAITER_A, 'running'],
+    [WAITER_B, 'running'],
+  ])
+  currentReader = reg.reader
+  listCalls = 0
+  otherAgentCalls = []
+  messagingCalls = []
+  sessionsCalls = []
+  const killsBefore = killLines().length
+  warnLines.length = 0
+  const t0 = Date.now()
+  const bPromise = capturedTool
+    .execute({ wait: true, waitMaxMs: B_CAP }, { agent: { id: WAITER_B } })
+    .then((res) => {
+      reg.set(WAITER_B, 'idle')
+      return res
+    })
+  const aPromise = capturedTool.execute({ wait: true, waitMaxMs: A_CAP }, { agent: { id: WAITER_A } })
+  const [resA, resB] = await Promise.all([aPromise, bPromise])
+  const windowMs = elapsedSince(t0)
+  const kills = await waitForKillLines(killsBefore + 1)
+  const log = warnLines.join('\n')
+  console.log(
+    `WAITERS:release A_cap=${A_CAP}ms B_cap=${B_CAP}ms wall=${windowMs}ms ` +
+      `A(ok=${resA.ok},waitedMs=${resA.waitedMs}) B(ok=${resB.ok},waitTimedOut=${resB.waitTimedOut},inFlight=${JSON.stringify(resB.inFlight)}) ` +
+      `list=${listCalls} agents-get/roots=${otherAgentCalls.length} messaging=${messagingCalls.length} kills=${kills.length - killsBefore}\n` +
+      `WAITERS:release-refusal B="${String(resB.error)}"`,
+  )
+  check(
+    'two-waiters-release-B-expires-naming-A',
+    resB.ok === false && resB.waitTimedOut === true && JSON.stringify(resB.inFlight) === JSON.stringify([WAITER_A]),
+    JSON.stringify(resB),
+  )
+  check(
+    'two-waiters-release-A-restarts',
+    resA.ok === true && resA.restarting === true && resA.sessionId === WAITER_A && resA.waitTimedOut === undefined,
+    JSON.stringify(resA),
+  )
+  // `waitedMs` is the REAL elapsed deferral: B released at ~400ms, A polls every
+  // 1000ms → A proceeds on its first poll (≈1000ms), never at t=0 and never at
+  // the cap.
+  check(
+    'two-waiters-release-A-waited-real-time',
+    typeof resA.waitedMs === 'number' &&
+      resA.waitedMs >= 900 &&
+      resA.waitedMs <= windowMs &&
+      resA.waitedMs < A_CAP,
+    `A waitedMs=${resA.waitedMs} wall=${windowMs}ms (B released at ~${B_CAP}ms, poll ${1_000}ms, cap ${A_CAP}ms)`,
+  )
+  check('two-waiters-release-spawn', kills.length === killsBefore + 1, `kills ${kills.length}`)
+  check('two-waiters-release-notice-anchored', pending() !== null && pending().sessionId === WAITER_A, JSON.stringify(pending()))
+  check(
+    'two-waiters-release-log-names-the-released-peer',
+    /wait end: registry IDLE after \d+ms \(\d+ poll\(s\)\) — released: head-test-waiter-B; proceeding with the restart/.test(log),
+    log
+      .split('\n')
+      .filter((l) => /wait (start|end)/.test(l))
+      .join(' | '),
+  )
+  check(
+    'two-waiters-release-passive',
+    otherAgentCalls.length === 0 && messagingCalls.length === 0,
+    `agents.get|roots: ${otherAgentCalls.join(',') || 'none'} / messaging: ${messagingCalls.join(',') || 'none'}`,
+  )
+}
+
+// --- 13. (a4) DERIVED — the ESCAPE HATCH during a mutual wait: while A and B
+//         are BOTH stuck waiting on each other, a THIRD caller with `force:true`
+//         restarts IMMEDIATELY (no wait at all) and A/B still expire. The
+//         bounded-cap livelock always has an exit; `force` is never queued
+//         behind other waiters.
+{
+  const CAP = 1_500
+  const reg = liveRegistry([
+    [WAITER_A, 'running'],
+    [WAITER_B, 'running'],
+  ])
+  currentReader = reg.reader
+  listCalls = 0
+  otherAgentCalls = []
+  messagingCalls = []
+  sessionsCalls = []
+  const killsBefore = killLines().length
+  warnLines.length = 0
+  const t0 = Date.now()
+  const aPromise = capturedTool.execute({ wait: true, waitMaxMs: CAP }, { agent: { id: WAITER_A } })
+  const bPromise = capturedTool.execute({ wait: true, waitMaxMs: CAP }, { agent: { id: WAITER_B } })
+  // Give both waits a real head start so the force call lands INSIDE them.
+  await settle(300)
+  const tForce = Date.now()
+  const resC = await capturedTool.execute({ force: true }, { agent: { id: FORCER_C } })
+  const forceMs = elapsedSince(tForce)
+  const kills = await waitForKillLines(killsBefore + 1)
+  const [resA, resB] = await Promise.all([aPromise, bPromise])
+  const windowMs = elapsedSince(t0)
+  await settle()
+  const EXPIRY_RE =
+    /^refusing to restart: 1 other session\(s\) mid-turn \((head-test-waiter-[AB])\) — the wait expired after \d+ms with those session\(s\) still mid-turn; pass force:true to override$/
+  const matchA = EXPIRY_RE.exec(String(resA.error))
+  const matchB = EXPIRY_RE.exec(String(resB.error))
+  console.log(
+    `WAITERS:force-during-mutual cap=${CAP}ms forceMs=${forceMs}ms wall=${windowMs}ms ` +
+      `C(ok=${resC.ok},sessionId=${resC.sessionId},waitedMs=${resC.waitedMs}) ` +
+      `A(ok=${resA.ok},blames=${matchA?.[1]}) B(ok=${resB.ok},blames=${matchB?.[1]}) kills=${kills.length - killsBefore}`,
+  )
+  check(
+    'two-waiters-force-escapes-immediately',
+    resC.ok === true && resC.restarting === true && resC.sessionId === FORCER_C && !('waitedMs' in resC),
+    `${JSON.stringify(resC)} (force never waits)`,
+  )
+  check('two-waiters-force-is-immediate', forceMs < 250, `${forceMs}ms while A and B were mid-wait`)
+  check('two-waiters-force-spawn', kills.length === killsBefore + 1, `kills ${kills.length}`)
+  check('two-waiters-force-notice-anchored', pending() !== null && pending().sessionId === FORCER_C, JSON.stringify(pending()))
+  check(
+    'two-waiters-force-leaves-both-waiters-expiring',
+    matchA !== null && matchA[1] === WAITER_B && matchB !== null && matchB[1] === WAITER_A && resA.ok === false && resB.ok === false,
+    `A="${String(resA.error)}" | B="${String(resB.error)}"`,
+  )
+  check(
+    'two-waiters-force-passive',
+    otherAgentCalls.length === 0 && messagingCalls.length === 0,
+    `agents.get|roots: ${otherAgentCalls.join(',') || 'none'} / messaging: ${messagingCalls.join(',') || 'none'} / sessions: ${sessionsCalls.join(',') || 'none'}`,
+  )
 }
 
 console.log(failures.length === 0 ? 'ALL:PASS' : `ALL:FAIL (${failures.length})`)
