@@ -76,7 +76,7 @@ If there is **no** pending notice, the plugin looks for a `shutdown-notice.json`
 
 This is what makes a **plain `systemctl restart`** that the agent ran — or a restart that happened while an agent was active — auto-notify that session at boot, with no user prompt and no need to have called `smart_restart`.
 
-Since **v0.6.0** the boot also auto-notifies the **interrupted heads**: every session of the recorded interrupted set that matches `ignoredSessionPrefixes` (Deepartments `head-<postId>` heads by default) receives its OWN resume notice once it comes live at boot — so after a restart that cut an active head turn, the organization is never left hanging in idle with no notice (fb-46). Heads are still never *pinned* as the single-session last-active target (the pin and the `shutdownTarget` gate keep ignoring `head-*`, preserving the v0.3.1 anti-spurious-notice behavior); only a head whose turn was genuinely cut is notified.
+Since **v0.6.0** (unreleased — see [CHANGELOG.md](CHANGELOG.md)) the boot also auto-notifies the **interrupted heads**: every session of the recorded interrupted set that matches `ignoredSessionPrefixes` (Deepartments `head-<postId>` heads by default) receives its OWN resume notice once it comes live at boot — so after a restart that cut an active head turn, the organization is never left hanging in idle with no notice (fb-46). Heads are still never *pinned* as the single-session last-active target (the pin and the `shutdownTarget` gate keep ignoring `head-*`, preserving the v0.3.1 anti-spurious-notice behavior); only a head whose turn was genuinely cut is notified.
 
 ### (c) External restart (systemd, host reboot, dev tools) — no active session
 
@@ -112,6 +112,7 @@ Registered via `ctx.tools.register` in `apply` (so it is available to agent sess
 | Param    | Type   | Required | Description |
 | -------- | ------ | -------- | ----------- |
 | `reason` | string | no       | Optional human-readable note, e.g. `"installed dshmarket in stable+dev"`. Included in the post-restart notice. |
+| `cause` | string | no      | Optional **intentional-restart family** — one of `canary`, `deploy` or `dshmarket` (the FB-234 GRACE set). Before the kill the tool writes `<runtimeStateDir>/restart-reason.json` **atomically** (tmp + rename), so the next boot is treated as an intentional restart — the health sidecar's crash streak never rises over it and the restart registry attributes the row to this cause. Use it for an intentional restart of a HEALTHY process; omit it for any other restart (no marker — the usual crash semantics). A canary-gated call implies `canary`. *(Unreleased, v0.6.0.)* |
 | `canary` | boolean | no      | Optional canary pre-restart validation for THIS call: boots an ephemeral DSH instance and aborts the restart on failure (see [Canary pre-restart validation](#canary-pre-restart-validation)). Overrides the configured `canary` for this call. |
 | `force` | boolean | no      | Explicit override of the [read-before-edit guard](#read-before-edit-guard): restart even when OTHER sessions are mid-turn. The tool refuses (and returns the in-flight session list) unless this is `true`; the override and the list are ALWAYS visible in the log. Use only after explicitly confirming the in-flight work is safe to interrupt. WINS over `wait`: with `force: true` the tool never waits. |
 | `wait` | boolean | no      | DEFER the restart instead of refusing it: re-read the LIVE agent registry (the same in-process snapshot the guard uses — it sends no message and wakes nobody) until every OTHER session is idle, then restart. Bounded by `waitMaxMs`; once the cap is spent the tool returns the SAME loud in-flight refusal and states that the wait expired (nothing is spawned, nothing is persisted). |
@@ -128,7 +129,7 @@ Registered via `ctx.tools.register` in `apply` (so it is available to agent sess
 
 ### Read-before-edit guard
 
-Since **v0.6.0**, `smart_restart` implements the **read-before-edit** pattern (fb-168): BEFORE persisting the pending notice or spawning the restart, the tool reads the **live agent registry** inside the DSH process — `ctx.agents`, a session whose `status === 'running'` has an active turn in flight (the same in-process signal Deepartments derives its "running" state from, and the marker of the exact work a restart would cut). This registry is updated synchronously by the harness on every `agent/status` transition, so the check **can never go stale** the way file-based state (e.g. a previously taken `posts.json` snapshot) could.
+Since **v0.6.0** (unreleased), `smart_restart` implements the **read-before-edit** pattern (fb-168): BEFORE persisting the pending notice or spawning the restart, the tool reads the **live agent registry** inside the DSH process — `ctx.agents`, a session whose `status === 'running'` has an active turn in flight (the same in-process signal Deepartments derives its "running" state from, and the marker of the exact work a restart would cut). This registry is updated synchronously by the harness on every `agent/status` transition, so the check **can never go stale** the way file-based state (e.g. a previously taken `posts.json` snapshot) could.
 
 - If **any session other than the calling session** is mid-turn, the tool returns `{ok: false, restarting: false, error: 'refusing to restart: N other session(s) mid-turn (…)' , inFlight: [<ids>]}` — the caller is excluded because it restarts itself intentionally and is pinned for resume.
 - An explicit **`force: true`** is the only way through; the override and the in-flight list are **always written to the log** (`[smart-restart] smart_restart: FORCE override — restarting with N other session(s) mid-turn: …`).
@@ -290,7 +291,7 @@ All behavior is controlled through the plugin row's `config`:
 | `restartUnit` | string  | `''`              | Systemd unit to restart when `smart_restart` is invoked (e.g. `dsh.service` or `dsh-deepartments-dev.service`). Since **v0.5.0** it is **auto-detected from `/proc/self/cgroup`** (the plugin's own unit) when empty; an explicit value always wins. Empty with no detectable unit → the tool fails safe with a clear error. |
 | `toolEnabled` | boolean | `true`            | Whether the `smart_restart` tool is registered (available to agent sessions). |
 | `shutdownGraceMs` | number | `600000`          | Grace window (ms, default 10 minutes) before shutdown within which last agent activity counts as "agent-involved" for the smart shutdown auto-notification. If the last-active session was idle beyond this window on shutdown, the pin is skipped and delivery falls back to `target`. |
-| `ignoredSessionPrefixes` | string[] | `['head-']` | Session-id prefixes that must never be selected as the single-session "last active" PIN for the smart-shutdown auto-notification — Deepartments department-head sessions (`head-<postId>`) never get a spurious pinned notice (the v0.3.1 regression). Since v0.6.0 the same prefixes identify the **interrupted-head resume recipients**: a head whose turn was genuinely cut by a restart still receives its own notice at boot (never a pin). Configurable list; default ON (heads skipped from the pin). |
+| `ignoredSessionPrefixes` | string[] | `['head-']` | Session-id prefixes that must never be selected as the single-session "last active" PIN for the smart-shutdown auto-notification — Deepartments department-head sessions (`head-<postId>`) never get a spurious pinned notice (the v0.3.1 regression). Since v0.6.0 (unreleased) the same prefixes identify the **interrupted-head resume recipients**: a head whose turn was genuinely cut by a restart still receives its own notice at boot (never a pin). Configurable list; default ON (heads skipped from the pin). |
 | `canary` | boolean | `false` | Opt-in [canary pre-restart validation](#canary-pre-restart-validation): boot an ephemeral DSH instance and abort the restart on failure. The per-call `canary` tool parameter overrides this for one call. |
 | `canaryTimeoutMs` | number | `45000` | Hard window (ms) for the canary boot liveness probe (default 45s); a timeout is a canary failure and aborts the restart. |
 | `canaryPort` | number | `0` | HTTP port for the ephemeral canary instance; `0` auto-picks a free port. |
@@ -364,14 +365,19 @@ Be honest about what this plugin does not do:
 
 ```
 src/
-  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool (incl. the read-before-edit active-agent guard (fb-168), the optional canary gate + abort alert, restartUnit auto-detection — resolveRestartUnit reads /proc/self/cgroup when config empty), delivery (followup/inject), interrupted-head resume notices (fb-168)
+  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool (incl. the read-before-edit active-agent guard (fb-168) with the bounded `wait` deferral, the optional canary gate + abort alert, restartUnit auto-detection — resolveRestartUnit reads /proc/self/cgroup when config empty), the FB-234 intentional-restart marker writer, delivery (followup/inject), interrupted-head resume notices (fb-168)
   boot.ts    — pure, deterministic restart + notice logic (I/O-free, unit-testable), incl. parseShutdownNotice / shutdownTarget / activeAgentGuard / guardRefusalMessage / waitForIdle / interruptedHeads
   canary.ts  — optional canary pre-restart validation: ExecStart derivation, temp patch build, free-port pick, dump-config pre-flight, boot + liveness probe (all IO injectable via CanaryHooks)
+  restart-reason.ts — the FB-234 intentional-restart MARKER WRITER: writes <runtimeStateDir>/restart-reason.json atomically before an intentional kill so the health sidecar excuses that boot instead of counting a crash streak (mirrors the sidecar's convention by code, never imports it)
 test/
   marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / activeAgentGuard / interruptedHeads / parseCgroupUnit / selectsAgent / targetsAgent / compiled exports
   notice.test.js  — buildNotice / humanizeDowntime
   canary.test.js  — deriveExecStartParams / buildPatchContent / pickFreePort / probeStatusHealthy / resolveExecTarget / runCanary with injected hooks
   wait.test.js    — waitForIdle / guardRefusalMessage (scripted registry + virtual clock) + the smart_restart wait-path harness (fixtures/smart-restart-wait-topology.js)
+  restart-reason.test.js — RESTART_REASON_CAUSES / resolveRestartCause / readCurrentBootId + the marker kill-path harness (fixtures/restart-reason-topology.js)
+  signal.test.js  — shouldReRaiseSignal + the host/bare SIGTERM topology smokes (fixtures/signal-topology.js)
+fixtures/
+  smart-restart-wait-topology.js / restart-reason-topology.js / signal-topology.js — child-process harnesses that boot the REAL plugin (apply + stub ctx) with the kill path replaced by a FAKE `setsid`: no systemd, no service, no /opt/dsh
 ```
 
 - `pnpm install` — install dependencies.
