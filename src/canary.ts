@@ -24,7 +24,7 @@
  * without a dsh service, /opt/dsh, or systemctl.
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -102,8 +102,15 @@ export interface CanaryHooks {
   spawnBoot?: (binary: string, profile: string, patchPath: string, port: number) => ChildProcess | null
   /** Poll HTTP liveness on the port until healthy or the timeout elapses. */
   probeLiveness?: (port: number, timeoutMs: number) => Promise<boolean>
-  /** Fetch one HTTP resource (boot page + each client bundle); null on a network-layer failure. */
-  fetchUrl?: (url: string, timeoutMs: number) => Promise<{ status: number; body: string } | null>
+  /** Fetch one HTTP resource (boot page + each client bundle); null on a network-layer failure.
+   *  The default CARRIES the browser-session cookie + pinned Host when the
+   *  authenticated path obtained one (the hardened tree's auth wall covers
+   *  the root document and every plugin bundle). */
+  fetchUrl?: (url: string, timeoutMs: number, headers?: Record<string, string>) => Promise<{ status: number; body: string } | null>
+  /** The ephemeral's captured stdout path (redirected into the canary tmpDir so
+   *  `dsh web:`'s launch-token URL line survives); null when the default spawn
+   *  was replaced by a hook that carries no transcript. */
+  readBootStdout?: () => string | null
   /** Kill the ephemeral's process group (negative pid). */
   killProcessGroup?: (pid: number) => void
   /** Read the deepartments CATALOG (posts.json) for the agent-liveness check;
@@ -332,11 +339,125 @@ export async function pickFreePort(): Promise<number> {
 }
 
 /**
- * Map ONE liveness attempt to healthy: only an HTTP 200 counts. A refused
- * connection (server not yet up) or any other status is NOT healthy.
+ * Map ONE liveness attempt to healthy.
+ *
+ * Two contracts, one historical:
+ *
+ *  · UNAUTHENTICATED (`authenticated` false) — hybrid: 200 (the pre-fix tree
+ *    serves the page to anyone) OR 401 (the hardened tree's auth wall is up:
+ *    HTTP answers and the auth is doing its job, which is MORE healthy, not
+ *    less — CVE-2026-82533). This is deliberately NOT "accept anything": a
+ *    refused connection / timeout (`undefined`, 0) or any other status
+ *    (500, 404, …) is still NOT healthy, and 401 earns liveness ONLY.
+ *  · AUTHENTICATED (`authenticated` true — the token path holds the
+ *    browser-session cookie) — STRICT 200: the wall must now open.
  */
-export function probeStatusHealthy(status: number | undefined): boolean {
-  return status === 200
+export function probeStatusHealthy(status: number | undefined, authenticated = false): boolean {
+  if (status === 200) return true
+  return !authenticated && status === 401
+}
+
+// --- launch-token capture (the authenticated canary, CVE-2026-82533) --------
+//
+// The 0.1.5 tree hardened the Web surface: the root document is behind a
+// browser-session auth wall, so an unauthenticated probe of `/` gets 401 and
+// the deep validation (HTTP 200 + client graph) can no longer run without the
+// credential. `dsh web` prints the ONE credential the process accepts — its
+// per-process launch token — as its `dsh web: <url>?token=<launchToken>` line,
+// and that line is what the canary now consumes: the ephemeral's stdout is
+// redirected into a file inside the per-canary tmpDir (the same tmpDir that
+// already holds `canary.patch.yml`), the line is parsed there, the token is
+// exchanged for the authority-bound session cookie, and the SAME credential is
+// reused for liveness, the boot page and every client bundle.
+//
+// The token VALUE is never logged, reported or returned: it lives only in the
+// cookie header threaded through the checks below (fb-16/fb-35).
+
+/** The root query parameter carrying `dsh web`'s launch token. */
+export const LAUNCH_TOKEN_QUERY = 'token'
+/** The startup line the web runtime prints its authenticated URL on. */
+const WEB_URL_LINE = /^dsh web:\s*(\S+)/
+
+/**
+ * Extract the launch token from ONE line of the web runtime's stdout.
+ *
+ * Only a `dsh web: <url>` line whose URL is a LOOPBACK URL on the expected
+ * port qualifies — a lookalike line (e.g. the runtime's "opening the default
+ * browser" notice) or a token minted for another instance never becomes the
+ * canary's credential. Returns null when the line carries none.
+ */
+export function parseLaunchTokenFromLine(line: string, port: number): string | null {
+  const match = WEB_URL_LINE.exec(line.trim())
+  if (!match) return null
+  let url: URL
+  try {
+    url = new URL(match[1])
+  } catch {
+    return null // not a URL — the lookalike notice line
+  }
+  if (url.protocol !== 'http:') return null
+  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '::1' || url.hostname === '[::1]'
+  if (!loopback || Number(url.port) !== port) return null
+  const tokens = url.searchParams.getAll(LAUNCH_TOKEN_QUERY)
+  if (tokens.length !== 1 || !tokens[0]) return null
+  return tokens[0]
+}
+
+/** Scan a whole captured stdout transcript for the launch token. */
+export function extractLaunchToken(stdout: string, port: number): string | null {
+  for (const line of stdout.split('\n')) {
+    const token = parseLaunchTokenFromLine(line, port)
+    if (token) return token
+  }
+  return null
+}
+
+/**
+ * Exchange the launch token ONCE for the authority-bound browser-session
+ * cookie.
+ *
+ * The runtime answers `GET /?token=…` with 303 + `set-cookie` and the cookie
+ * is WHATWG-authority-bound (its name and signed audience derive from the
+ * request authority), so the exchange and every later read must carry the
+ * SAME `127.0.0.1:<port>` authority — hence the explicit `Host` header. Node's
+ * `fetch` keeps no cookie jar, so `redirect: 'manual'` is used and the
+ * `set-cookie` is read off the 303 by hand. The body is drained and never
+ * read; only the cookie NAME=VALUE pair is returned (never the token, never
+ * the signed payload). A non-303 means the token was refused: null, and the
+ * caller falls back to the unauthenticated liveness.
+ */
+export async function exchangeLaunchTokenForCookie(
+  baseUrl: string,
+  token: string,
+  timeoutMs: number,
+): Promise<string | null> {
+  const url = new URL(baseUrl)
+  url.pathname = '/'
+  url.search = ''
+  url.hash = ''
+  url.searchParams.set(LAUNCH_TOKEN_QUERY, token)
+  try {
+    const res = await fetch(url.href, {
+      redirect: 'manual',
+      headers: { host: new URL(baseUrl).host },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []
+    try {
+      await res.body?.cancel()
+    } catch {
+      // body already gone — nothing to drain
+    }
+    if (res.status !== 303) return null
+    for (const raw of setCookies) {
+      const pair = raw.split(';', 1)[0]?.trim()
+      // A cookie NAME=VALUE only: a token echo can never pass this shape.
+      if (pair && /^[^=;,\s]+=[^=;,\s]*$/.test(pair)) return pair
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
 // --- client boot-graph validation (the P1 GUI lesson, 2026-08-29) ------------
@@ -466,7 +587,12 @@ export function clientBundleRegistersId(bundleSource: string, rowId: string): bo
 export async function checkClientGraph(
   port: number,
   timeoutMs: number,
-  fetchUrl: (url: string, timeoutMs: number) => Promise<{ status: number; body: string } | null>,
+  fetchUrl: (
+    url: string,
+    timeoutMs: number,
+    headers?: Record<string, string>,
+  ) => Promise<{ status: number; body: string } | null>,
+  cookie?: string,
 ): Promise<ClientGraphCheckResult> {
   const origin = `http://127.0.0.1:${port}`
   const deadline = Date.now() + timeoutMs
@@ -474,7 +600,13 @@ export async function checkClientGraph(
   if (remaining() <= 0) {
     return { ok: false, detail: 'client-graph: phase timeout exceeded before the first fetch' }
   }
-  const page = await fetchUrl(`${origin}/`, Math.min(3000, remaining()))
+  // The authenticated read: the browser-session cookie (opaque NAME=VALUE,
+  // never the launch token) rides every request of this check, since the
+  // hardened tree answers the root document AND the plugin bundles from
+  // behind the same auth wall. The cookie is bound to the `127.0.0.1:<port>`
+  // authority the exchange used, so the Host must stay pinned to it.
+  const headers = cookie === undefined ? undefined : { host: `127.0.0.1:${port}`, cookie }
+  const page = await fetchUrl(origin + '/', Math.min(3000, remaining()), headers)
   if (!page) {
     return { ok: false, detail: 'client-graph: boot HTML unavailable (ephemeral instance unreachable after liveness)' }
   }
@@ -498,7 +630,7 @@ export async function checkClientGraph(
       return { ok: false, detail: `client-graph: timed out before validating all ${graph.entries.length} row(s)` }
     }
     const url = new URL(row.url, origin).href
-    const res = await fetchUrl(url, Math.min(3000, left))
+    const res = await fetchUrl(url, Math.min(3000, left), headers)
     if (!res) {
       failures.push(`row "${row.id}" bundle fetch failed at ${url}`)
     } else if (res.status !== 200) {
@@ -960,7 +1092,7 @@ function dumpConfigDefault(binary: string, profile: string, patchPath: string): 
 function spawnBootDefault(binary: string, profile: string, patchPath: string, port: number): ChildProcess | null {
   const argv = [binary]
   if (profile) argv.push('--profile', profile)
-  argv.push('--patch', patchPath, '--port', String(port))
+  argv.push('--patch', patchPath, '--port', String(port), '--no-open')
   try {
     // FB-234 acceptance-1: boot the ephemeral with ITS OWN cwd = the isolated
     // per-canary temp overlay dir (the dir that also holds the patch file —
@@ -974,7 +1106,22 @@ function spawnBootDefault(binary: string, profile: string, patchPath: string, po
     // With cwd = tmpDir the relative `.deepartments` resolves inside the temp
     // store: 0 consume of the LIVE marker, 0 stamp of LIVE boot-crash.json, 0
     // LIVE heartbeat from the canary (the ephemeral dies with its tmpDir).
-    const child = spawn('setsid', argv, { detached: true, stdio: 'ignore', cwd: dirname(patchPath) })
+    //
+    // The 0.1.5 auth wall makes `dsh web`'s stdout the ONLY place the
+    // ephemeral's per-process launch token ever appears, so it must not be
+    // discarded: the fd is redirected into a file INSIDE the same tmpDir that
+    // already holds `canary.patch.yml` (which runCanary removes wholesale in
+    // its finally). The token itself is never parsed here — only captured.
+    const out = openSync(join(dirname(patchPath), BOOT_STDOUT_FILE), 'w')
+    const err = openSync(join(dirname(patchPath), BOOT_STDERR_FILE), 'w')
+    let child: ChildProcess
+    try {
+      child = spawn('setsid', argv, { detached: true, stdio: ['ignore', out, err], cwd: dirname(patchPath) })
+    } finally {
+      // The child holds its own descriptors; the parent's must not leak.
+      closeSync(out)
+      closeSync(err)
+    }
     child.unref()
     return child
   } catch {
@@ -982,27 +1129,44 @@ function spawnBootDefault(binary: string, profile: string, patchPath: string, po
   }
 }
 
-async function probeLivenessDefault(port: number, timeoutMs: number): Promise<boolean> {
+/** The captured `dsh web` stdout transcript (the launch-token URL line). */
+const BOOT_STDOUT_FILE = 'dsh-web.stdout.log'
+/** The captured `dsh web` stderr (diagnostics only; never parsed). */
+const BOOT_STDERR_FILE = 'dsh-web.stderr.log'
+
+/**
+ * Default liveness prober.
+ *
+ * Unauthenticated (no cookie yet) the probe accepts the hybrid contract:
+ * 200 OR 401 (see `probeStatusHealthy`). With the launch-token cookie the
+ * wall must open: STRICT 200.
+ */
+async function probeLivenessDefault(port: number, timeoutMs: number, cookie?: string): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   const url = `http://127.0.0.1:${port}/`
+  const headers = cookie === undefined ? undefined : { host: `127.0.0.1:${port}`, cookie }
   for (;;) {
     const remaining = deadline - Date.now()
     if (remaining <= 0) return false
     let status: number | undefined
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(Math.min(800, remaining)) })
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(Math.min(800, remaining)) })
       status = res.status
     } catch {
       status = undefined // ECONNREFUSED (not yet up) or per-attempt timeout
     }
-    if (probeStatusHealthy(status)) return true
+    if (probeStatusHealthy(status, cookie !== undefined)) return true
     await new Promise((resolve) => setTimeout(resolve, Math.min(500, remaining)))
   }
 }
 
-async function fetchUrlDefault(url: string, timeoutMs: number): Promise<{ status: number; body: string } | null> {
+async function fetchUrlDefault(
+  url: string,
+  timeoutMs: number,
+  headers?: Record<string, string>,
+): Promise<{ status: number; body: string } | null> {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) })
     const body = await res.text()
     return { status: res.status, body }
   } catch {
@@ -1068,6 +1232,12 @@ export const defaultCanaryHooks: CanaryHooks = {
   spawnBoot: spawnBootDefault,
   probeLiveness: probeLivenessDefault,
   fetchUrl: fetchUrlDefault,
+  // NOTE: no `readBootStdout` here on purpose. The capture target lives in the
+  // PER-CALL tmpDir that only runCanary knows, so runCanary supplies its own
+  // default (`<tmpDir>/dsh-web.stdout.log`); declaring a value here would win
+  // that `??` and silently disable the launch-token capture in production
+  // (index.ts calls runCanary with NO hooks, so these defaults are the real
+  // path).
   killProcessGroup: killProcessGroupDefault,
   // The post-boot runtime checks read through these; runCanary BINDS them to
   // the effective config (paths) and ctx (the live registry) per call.
@@ -1245,7 +1415,52 @@ export async function runCanary(
       return { status: 'failed', detail: 'canary boot could not be spawned' }
     }
 
-    const healthy = await (hooks.probeLiveness ?? probeLivenessDefault)(port, cfg.canaryTimeoutMs)
+    // ── Launch-token capture (CVE-2026-82533 auth wall). The ephemeral's
+    //    `dsh web:` line names the ONLY credential it accepts; the default
+    //    spawn redirected that stdout into `<tmpDir>/dsh-web.stdout.log`, so
+    //    the line survives. The token is exchanged ONCE for the
+    //    authority-bound browser-session cookie and the cookie is what the
+    //    checks below carry — the token value is never logged nor returned.
+    //    Capture is BEST-EFFORT, bounded by the liveness window: a tree that
+    //    prints no URL (or a hook carrying no transcript) leaves `cookie`
+    //    undefined and every check falls back to its unauthenticated
+    //    contract, so no install is newly blocked by this step.
+    const readBootStdout = hooks.readBootStdout ?? (() => readFileSafe(join(tmpDir, BOOT_STDOUT_FILE)))
+    const livenessDeadline = Date.now() + cfg.canaryTimeoutMs
+    // The capture waits for the boot to settle — the SAME event liveness waits
+    // for — so it may only spend a BOUNDED SLICE of the window. Spending the
+    // whole window here would leave the prober a zero budget and fail a tree
+    // that simply prints no URL line.
+    const captureDeadline = Math.min(livenessDeadline, Date.now() + Math.min(2000, Math.floor(cfg.canaryTimeoutMs / 2)))
+    let cookie: string | undefined
+    for (;;) {
+      const token = extractLaunchToken(readBootStdout() ?? '', port)
+      if (token) {
+        // The line lands once the boot settles; the exchange is one 303.
+        cookie = (await exchangeLaunchTokenForCookie(
+          `http://127.0.0.1:${port}`,
+          token,
+          Math.min(3000, Math.max(1, livenessDeadline - Date.now())),
+        )) ?? undefined
+        break
+      }
+      const left = captureDeadline - Date.now()
+      if (left <= 0) break // no token line — hybrid liveness below
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, left)))
+    }
+
+    // The prober keeps whatever budget the capture left, so the whole
+    // post-spawn wait stays inside ONE `canaryTimeoutMs` window. The
+    // DEFAULT prober is always the cookie-aware closure below: in production
+    // `hooks.probeLiveness` IS `probeLivenessDefault`, and calling that
+    // arity-2 reference directly would drop the cookie and strand every
+    // request at the auth wall — the exact defect this fix removes.
+    const livenessBudget = Math.max(1, livenessDeadline - Date.now())
+    const prober = hooks.probeLiveness
+    const healthy =
+      prober === undefined || prober === probeLivenessDefault
+        ? await probeLivenessDefault(port, livenessBudget, cookie)
+        : await prober(port, livenessBudget)
     if (!healthy) {
       // Always stop the ephemeral instance before returning.
       if (spawned.pid !== undefined) {
@@ -1273,6 +1488,7 @@ export async function runCanary(
         port,
         cfg.canaryClientTimeoutMs ?? DEFAULT_CLIENT_CHECK_TIMEOUT_MS,
         hooks.fetchUrl ?? fetchUrlDefault,
+        cookie,
       )
       if (!graphCheck.ok) {
         // Always stop the ephemeral instance before returning.

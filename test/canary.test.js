@@ -5,6 +5,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -17,7 +18,10 @@ import {
   clientBundleRegistersId,
   deriveExecStartParams,
   deriveLiveStateDirOverrides,
+  exchangeLaunchTokenForCookie,
   extractBootGraph,
+  extractLaunchToken,
+  parseLaunchTokenFromLine,
   parseCatalogMembers,
   pickFreePort,
   probeStatusHealthy,
@@ -1285,4 +1289,229 @@ test('fb-234 GAP-2 blanket (runCanary e2e): with a dump-config carrying LIVE sta
   // No derived row is left pointing at the live store.
   assert.ok(!spawnedPatch.includes('stateDir: "/.deepartments"'), 'no row resolves to /.deepartments in the final patch')
   assert.ok(!/- id: [a-z-]+[\s\S]*stateDir: "?\.deepartments"?/.test(spawnedPatch), 'no row resolves to the bare .deepartments in the final patch')
+})
+
+// --- CVE-2026-82533: the authenticated canary probe (vía B + hybrid liveness) -
+//
+// The 0.1.5 tree put the Web surface behind a browser-session auth wall: an
+// unauthenticated read of `/` answers 401, so the OLD probe (200-only) burned
+// its whole window and declared a HEALTHY tree unsound — the canary blocked the
+// CVE switch's step (e). The fix: capture the launch token `dsh web` prints in
+// the ephemeral's redirected stdout, exchange it for the authority-bound
+// cookie, ride that cookie through liveness + boot page + every client bundle,
+// and keep an UNAUTHENTICATED liveness that accepts 200 OR 401 (the wall is
+// UP and doing its job) while still refusing "no answer" (undefined/0/500).
+//
+// The token value below is a FIXTURE literal, never a real credential.
+
+const TOKEN_LINE_PORT = 41500
+const FIXTURE_TOKEN = 'fixture-launch-token-not-a-credential'
+const TOKEN_STDOUT_LINE = `dsh web: http://127.0.0.1:${TOKEN_LINE_PORT}/?token=${FIXTURE_TOKEN}\n`
+
+test('hybrid liveness: 200 and 401 are both healthy UNAUTHENTICATED; a token-backed read demands strict 200', () => {
+  // Alive: 200 (pre-fix tree) or 401 (hardened tree's wall is up).
+  assert.equal(probeStatusHealthy(200), true)
+  assert.equal(probeStatusHealthy(401), true)
+  // NOT alive: no response at all, or a non-auth failure status.
+  assert.equal(probeStatusHealthy(undefined), false) // ECONNREFUSED → no response
+  assert.equal(probeStatusHealthy(0), false)
+  assert.equal(probeStatusHealthy(404), false)
+  assert.equal(probeStatusHealthy(500), false)
+  // The token path must prove the wall OPENS: 401 there is a real failure.
+  assert.equal(probeStatusHealthy(200, true), true)
+  assert.equal(probeStatusHealthy(401, true), false)
+  assert.equal(probeStatusHealthy(undefined, true), false)
+})
+
+test('parseLaunchTokenFromLine: reads the token only off a loopback `dsh web:` URL line on THIS port', () => {
+  assert.equal(parseLaunchTokenFromLine(TOKEN_STDOUT_LINE.trim(), TOKEN_LINE_PORT), FIXTURE_TOKEN)
+  // The lookalike notice line the runtime also prints is NOT a URL.
+  assert.equal(parseLaunchTokenFromLine('dsh web: opening the default browser; pass --no-open to disable', TOKEN_LINE_PORT), null)
+  // Another instance's line (wrong port) is never adopted as this canary's credential.
+  assert.equal(parseLaunchTokenFromLine(TOKEN_STDOUT_LINE.trim(), TOKEN_LINE_PORT + 1), null)
+  // A non-loopback host is refused (the credential would not be authority-bound to us).
+  assert.equal(parseLaunchTokenFromLine(`dsh web: http://example.test:${TOKEN_LINE_PORT}/?token=x`, TOKEN_LINE_PORT), null)
+  // No token query at all.
+  assert.equal(parseLaunchTokenFromLine(`dsh web: http://127.0.0.1:${TOKEN_LINE_PORT}/`, TOKEN_LINE_PORT), null)
+})
+
+test('extractLaunchToken: scans a whole transcript; absent/unreadable → null (capture is best-effort)', () => {
+  assert.equal(extractLaunchToken(`noise\nnoise\n${TOKEN_STDOUT_LINE}\nmore noise\n`, TOKEN_LINE_PORT), FIXTURE_TOKEN)
+  assert.equal(extractLaunchToken('', TOKEN_LINE_PORT), null)
+  assert.equal(extractLaunchToken('dsh web: opening the default browser; pass --no-open to disable\n', TOKEN_LINE_PORT), null)
+})
+
+test('checkClientGraph: the cookie (and pinned Host) ride the boot page AND every bundle when authenticated', async () => {
+  const seen = []
+  const fetchUrl = async (url, _timeoutMs, headers) => {
+    seen.push({ url, headers })
+    if (url.endsWith('/')) return { status: 200, body: bootHtml(HEALTHY_GRAPH) }
+    for (const row of HEALTHY_GRAPH.entries) {
+      if (url.includes(`/plugins/${row.id}/client.js`)) return { status: 200, body: bundleFor(row.id) }
+    }
+    return { status: 404, body: '' }
+  }
+  const cookie = 'dsh-session-fixture=opaque'
+  const r = await checkClientGraph(41501, 5000, fetchUrl, cookie)
+  assert.equal(r.ok, true, r.detail)
+  assert.equal(r.checked, 2)
+  assert.equal(seen.length, 3, 'boot page + one fetch per graph row')
+  for (const call of seen) {
+    assert.equal(call.headers.cookie, cookie, `cookie must ride ${call.url}`)
+    assert.equal(call.headers.host, '127.0.0.1:41501', `Host must stay pinned for ${call.url}`)
+  }
+})
+
+test('checkClientGraph: UNauthenticated (no cookie) the fetches carry no headers at all — the 200 requirement is unchanged', async () => {
+  const seen = []
+  const fetchUrl = async (url, _timeoutMs, headers) => {
+    seen.push({ url, headers })
+    if (url.endsWith('/')) return { status: 200, body: bootHtml(HEALTHY_GRAPH) }
+    for (const row of HEALTHY_GRAPH.entries) {
+      if (url.includes(`/plugins/${row.id}/client.js`)) return { status: 200, body: bundleFor(row.id) }
+    }
+    return { status: 404, body: '' }
+  }
+  const r = await checkClientGraph(41502, 5000, fetchUrl)
+  assert.equal(r.ok, true, r.detail)
+  assert.ok(seen.every((call) => call.headers === undefined), 'no credential means no headers')
+})
+
+test('runCanary: behind the auth wall the probe passes WITHOUT a captured token via the hybrid 200|401 liveness', async () => {
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41503,
+    dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+    spawnBoot: () => ({ pid: 4520 }),
+    // The hardened tree: no token captured, every unauthenticated read is 401.
+    probeLiveness: async () => probeStatusHealthy(401),
+    readBootStdout: () => null,
+    killProcessGroup: () => {},
+  }
+  const r = await runCanary(
+    undefined,
+    {
+      ...baseCfg,
+      canaryClientCheck: false,
+      canaryAgentCheck: false,
+      canaryPoolerCheck: false,
+      canaryMarkersCheck: false,
+    },
+    {},
+    hooks,
+  )
+  assert.equal(r.status, 'passed', r.detail)
+})
+
+test('runCanary: 401 on the TOKEN path fails — the wall must OPEN, not merely exist', async () => {
+  let probed = 0
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41504,
+    dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+    spawnBoot: () => ({ pid: 4521 }),
+    // A client-check pass would prove the deepest layer; it never gets there.
+    probeLiveness: async (port, timeoutMs) => {
+      probed += 1
+      return probeStatusHealthy(401, true) // strict path, no cookie
+    },
+    readBootStdout: () => null,
+    killProcessGroup: () => {},
+  }
+  const r = await runCanary(
+    undefined,
+    {
+      ...baseCfg,
+      canaryClientCheck: false,
+      canaryAgentCheck: false,
+      canaryPoolerCheck: false,
+      canaryMarkersCheck: false,
+    },
+    {},
+    hooks,
+  )
+  assert.equal(r.status, 'failed', r.detail)
+  assert.match(r.detail, /did not become healthy/)
+  assert.ok(probed > 0)
+})
+
+test('runCanary e2e against a REAL auth-walled server: the exchange opens the wall, the cookie rides the client graph, the token never surfaces', async () => {
+  // The server stands in for the hardened 0.1.5 web surface: `/` is behind the
+  // browser-session auth wall (401 unauth, 303 + set-cookie on a valid token,
+  // 200 on a valid cookie), and it serves a HEALTHY client graph once open.
+  const SESSION_COOKIE_NAME = 'dsh-session-fixture'
+  const setCookies = []
+  let unauthRootReads = 0
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (url.pathname === '/') {
+      const token = url.searchParams.get('token')
+      const cookie = req.headers.cookie ?? ''
+      if (token === FIXTURE_TOKEN) {
+        const value = `${SESSION_COOKIE_NAME}=opaque-session-value`
+        setCookies.push(value)
+        res.writeHead(303, { location: '/', 'set-cookie': value })
+        res.end()
+        return
+      }
+      if (cookie.includes(`${SESSION_COOKIE_NAME}=opaque-session-value`)) {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(bootHtml(HEALTHY_GRAPH))
+        return
+      }
+      unauthRootReads += 1
+      res.writeHead(401, { 'content-type': 'text/plain' })
+      res.end('dsh web authentication required; reopen the URL printed by dsh web.\n')
+      return
+    }
+    for (const row of HEALTHY_GRAPH.entries) {
+      if (url.pathname === `/plugins/${row.id}/client.js`) {
+        res.writeHead(200, { 'content-type': 'application/javascript' })
+        res.end(bundleFor(row.id))
+        return
+      }
+    }
+    res.writeHead(404).end()
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'dsh-canary-auth-'))
+  try {
+    // The captured transcript carries the URL line `dsh web` prints (port-pinned).
+    const stdoutPath = join(tmpRoot, 'dsh-web.stdout.log')
+    writeFileSync(stdoutPath, `dsh web: http://127.0.0.1:${port}/?token=${FIXTURE_TOKEN}\n`, 'utf8')
+    const seenCookies = []
+    const hooks = {
+      execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+      dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+      spawnBoot: () => ({ pid: 4522 }),
+      readBootStdout: () => readFileSync(stdoutPath, 'utf8'),
+      killProcessGroup: () => {},
+    }
+    const r = await runCanary(
+      undefined,
+      {
+        ...baseCfg,
+        canaryTimeoutMs: 5000,
+        canaryPort: port,
+        canaryClientCheck: true,
+        canaryAgentCheck: false,
+        canaryPoolerCheck: false,
+        canaryMarkersCheck: false,
+      },
+      {},
+      hooks,
+    )
+    assert.equal(r.status, 'passed', r.detail)
+    // The token WAS exchanged exactly once, and the wall then opened.
+    assert.equal(setCookies.length, 1, 'the launch token was exchanged exactly once')
+    assert.ok(unauthRootReads <= 1, `the cookie opened the wall after at most one 401 retry, got ${unauthRootReads}`)
+    assert.match(r.detail, /client row\(s\) register their graph id/)
+    // REDACTION: the reported detail never carries the token value (fb-16/fb-35).
+    assert.ok(!r.detail.includes(FIXTURE_TOKEN), 'the launch token must never surface in the canary detail')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    rmSync(tmpRoot, { recursive: true, force: true })
+  }
 })
