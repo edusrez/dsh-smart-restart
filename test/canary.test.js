@@ -317,7 +317,7 @@ test('client-graph check: a healthy boot (every row registers its id) passes', a
   const r = await checkClientGraph(41240, 5000, fetchUrl)
   assert.equal(r.ok, true)
   assert.equal(r.checked, 2)
-  assert.match(r.detail, /2 client row\(s\) register their graph id/)
+  assert.match(r.detail, /2 checked · 0 unavailable \(HTTP n\) · 0 not-attempted-or-unreachable/)
 })
 
 test('client-graph check: P1 regression fixture — row "dshd-gui" served a bundle registering "dsh-deepartments" FAILS', async () => {
@@ -354,6 +354,161 @@ test('client-graph check: a boot serving no __DSH_BOOT__ (non-web surface) passe
   assert.match(r.detail, /no __DSH_BOOT__ client graph served/)
 })
 
+// --- fb-1908: the THREE counters + the SETTLE (server mid-startup) -----------
+//
+// THE DEFECT (fb-1908): the pre-fix phase swept the graph ONCE, right after the
+// liveness probe — i.e. in the window where «the plugin server is still coming
+// up» and «the bundle is broken» are INDISTINGUISHABLE (both reach
+// fetchUrlDefault's null) — and rendered the former as the latter ("bundle
+// fetch failed"). Measured symptom: 7/31/36 unresolved rows on a QUIET tree,
+// while the same tree, mature, serves every bundle with 200 in 2-11 ms.
+
+test('fb-1908a: the render carries the THREE differentiated counters (checked · unavailable (HTTP n) · not-attempted-or-unreachable)', async () => {
+  const graph = {
+    rev: 'r',
+    entries: [
+      { id: 'ok-row', url: '/plugins/ok-row/client.js?rev=r1', rev: 'r1' },
+      { id: 'gone-row', url: '/plugins/gone-row/client.js?rev=r2', rev: 'r2' },
+    ],
+  }
+  const fetchUrl = serveFixture(graph, { 'ok-row': bundleFor('ok-row') }) // gone-row → 404
+  const r = await checkClientGraph(41260, 5000, fetchUrl)
+  assert.equal(r.ok, false)
+  // The three counters are all present and each names its class explicitly.
+  assert.match(r.detail, /1 checked · 1 unavailable \(HTTP n\) · 0 not-attempted-or-unreachable/)
+  assert.equal(r.checked, 1)
+  assert.equal(r.unavailable, 1)
+  assert.equal(r.unsatisfiable, 0)
+  assert.equal(r.notAttempted, 0)
+  assert.equal(r.failed, 1)
+})
+
+test('fb-1908b: SETTLE — a server that is NOT READY YET is not a broken bundle: the phase waits and then reaches the healthy verdict', async () => {
+  // A deliberately mid-startup server: for the first ~600 ms it answers
+  // NOTHING (connection refused / timeout → fetchUrlDefault's null). The
+  // pre-fix sweep would have called every row «bundle fetch failed» at t≈0.
+  const graph = HEALTHY_GRAPH
+  const notReadyForMs = 600
+  const startedAt = Date.now()
+  let answeredNulls = 0
+  const fetchUrl = async (url, _timeoutMs) => {
+    if (Date.now() - startedAt < notReadyForMs) {
+      answeredNulls += 1
+      return null // ECONNREFUSED: the plugin server is still starting
+    }
+    if (url.endsWith('/')) return { status: 200, body: bootHtml(graph) }
+    for (const row of graph.entries) {
+      if (url.includes(`/plugins/${row.id}/client.js`)) return { status: 200, body: bundleFor(row.id) }
+    }
+    return { status: 404, body: '' }
+  }
+  const r = await checkClientGraph(41261, 5000, fetchUrl)
+  assert.ok(answeredNulls >= 1, 'the fixture must have served real nulls before becoming ready')
+  assert.equal(r.ok, true, r.detail)
+  assert.equal(r.checked, 2)
+  assert.equal(r.notAttempted, 0)
+  assert.match(r.detail, /2 checked · 0 unavailable \(HTTP n\) · 0 not-attempted-or-unreachable/)
+  assert.ok(!/not-attempted-or-unreachable/.test(r.detail.replace(/· 0 not-attempted-or-unreachable/, '')), 'no unproven class remains')
+})
+
+test('fb-1908b: a server that NEVER becomes ready reports the unproven class — and NEVER the word «broken» or a fabricated failure', async () => {
+  const graph = HEALTHY_GRAPH
+  const r = await checkClientGraph(41262, 600, async () => null) // nothing ever answers
+  assert.equal(r.ok, false) // the restart must not proceed on an unproven tree
+  assert.equal(r.checked, 0)
+  assert.equal(r.unavailable, 0)
+  assert.equal(r.unsatisfiable, 0)
+  assert.equal(r.notAttempted, 0) // the phase never reached the row sweep
+  assert.match(r.detail, /0 checked · 0 unavailable \(HTTP n\) · 0 not-attempted-or-unreachable/)
+  assert.match(r.detail, /never answered/)
+  assert.match(r.detail, /NOT a broken bundle/)
+  assert.ok(!/bundle fetch failed/.test(r.detail), 'the pre-fix ambiguity must be gone')
+  assert.ok(!/row ".*" bundle unavailable/.test(r.detail), 'no row may be reported as a proven failure')
+})
+
+test('fb-1908b: rows that answer late are PROVEN by the settle sweep, while a REAL 404 latches on the first answer', async () => {
+  const graph = {
+    rev: 'r',
+    entries: [
+      { id: 'slow-row', url: '/plugins/slow-row/client.js?rev=r1', rev: 'r1' },
+      { id: 'broken-row', url: '/plugins/broken-row/client.js?rev=r2', rev: 'r2' },
+    ],
+  }
+  const startedAt = Date.now()
+  const fetchUrl = async (url, _timeoutMs) => {
+    if (url.endsWith('/')) return { status: 200, body: bootHtml(graph) }
+    if (url.includes('/plugins/slow-row/')) {
+      // Comes up late, then serves a healthy bundle.
+      if (Date.now() - startedAt < 400) return null
+      return { status: 200, body: bundleFor('slow-row') }
+    }
+    return { status: 404, body: '' } // a REAL failure: proven the first time it answers
+  }
+  const r = await checkClientGraph(41263, 5000, fetchUrl)
+  assert.equal(r.ok, false) // the 404 is a real failure
+  assert.equal(r.checked, 1)
+  assert.equal(r.unavailable, 1)
+  assert.match(r.detail, /1 checked · 1 unavailable \(HTTP n\) · 0 not-attempted-or-unreachable/)
+  assert.match(r.detail, /row "broken-row" bundle unavailable \(HTTP 404/)
+})
+
+test('fb-1908c: the detail does NOT truncate PROVEN failures — four real failures are all named', async () => {
+  const ids = ['f1', 'f2', 'f3', 'f4']
+  const graph = { rev: 'r', entries: ids.map((id) => ({ id, url: `/plugins/${id}/client.js?rev=r`, rev: 'r' })) }
+  const r = await checkClientGraph(41264, 5000, serveFixture(graph, {})) // all 404
+  assert.equal(r.ok, false)
+  assert.equal(r.failed, 4)
+  assert.equal(r.unavailable, 4)
+  for (const id of ids) {
+    assert.match(r.detail, new RegExp(`row "${id}" bundle unavailable \\(HTTP 404`), `${id} must be named in full`)
+  }
+  assert.ok(!/and \d+ more/.test(r.detail), 'no «and N more» truncation of proven failures')
+})
+
+test('fb-1908c: the unproven class is reported APART as its own count (never folded into the failure count)', async () => {
+  const graph = {
+    rev: 'r',
+    entries: [
+      { id: 'served', url: '/plugins/served/client.js?rev=r1', rev: 'r1' },
+      { id: 'gone', url: '/plugins/gone/client.js?rev=r2', rev: 'r2' },
+    ],
+  }
+  const fetchUrl = async (url, _timeoutMs) => {
+    if (url.endsWith('/')) return { status: 200, body: bootHtml(graph) }
+    if (url.includes('/plugins/served/')) return { status: 200, body: bundleFor('served') }
+    return null // «gone» never answers — the unproven class
+  }
+  const r = await checkClientGraph(41265, 700, fetchUrl)
+  assert.equal(r.ok, true, r.detail) // one row proven OK and NO proven failure
+  assert.equal(r.checked, 1)
+  assert.equal(r.failed, 0)
+  assert.equal(r.notAttempted, 1)
+  assert.match(r.detail, /1 checked · 0 unavailable \(HTTP n\) · 1 not-attempted-or-unreachable/)
+  assert.match(r.detail, /NOT a failure/)
+  assert.match(r.detail, /gone/)
+})
+
+test('fb-1908: ZERO rows verified is NOT a clean pass — unproven, and it says so without calling the tree broken', async () => {
+  // The page answers but NO bundle ever answers: the phase can prove nothing.
+  // A canary that verifies ZERO rows must not report a clean verdict (a zero
+  // without a positive control does not prove the tree is sane) — while still
+  // never calling it a broken bundle.
+  const r = await checkClientGraph(41266, 1_200, async (url, _timeoutMs) => {
+    if (url.endsWith('/')) return { status: 200, body: bootHtml(HEALTHY_GRAPH) }
+    return null // every bundle: still coming up
+  })
+  assert.equal(r.ok, false)
+  assert.equal(r.checked, 0)
+  assert.equal(r.failed, 0)
+  assert.equal(r.unavailable, 0)
+  assert.equal(r.unsatisfiable, 0)
+  assert.equal(r.notAttempted, 2)
+  assert.match(r.detail, /0 checked · 0 unavailable \(HTTP n\) · 2 not-attempted-or-unreachable/)
+  assert.match(r.detail, /UNPROVEN, NOT broken/)
+  assert.ok(!/bundle fetch failed/.test(r.detail), 'the pre-fix ambiguity must be gone')
+  assert.ok(!/unsatisfiable/.test(r.detail.replace(/registers no\/another id/g, '')), 'no row may be called a proven failure')
+})
+
 test('runCanary: FAILS on a client row the served bundle cannot satisfy (the P1 config shape)', async () => {
   const brokenGraph = { rev: 'r', entries: [{ id: 'dshd-gui', url: '/plugins/dshd-gui/client.js?rev=r1', rev: 'r1' }] }
   const hooks = {
@@ -387,7 +542,7 @@ test('runCanary: passes a healthy boot and reports the client rows checked', asy
   }
   const r = await runCanary(undefined, { ...baseCfg, canaryPort: 41245, canaryTimeoutMs: 2000 }, {}, hooks)
   assert.equal(r.status, 'passed')
-  assert.match(r.detail, /client-graph: 2 client row\(s\) register their graph id/)
+  assert.match(r.detail, /client-graph: 2 checked · 0 unavailable \(HTTP n\) · 0 not-attempted-or-unreachable/)
 })
 
 test('runCanary: one unsatisfiable row among healthy rows fails the whole canary', async () => {
@@ -1507,7 +1662,7 @@ test('runCanary e2e against a REAL auth-walled server: the exchange opens the wa
     // The token WAS exchanged exactly once, and the wall then opened.
     assert.equal(setCookies.length, 1, 'the launch token was exchanged exactly once')
     assert.ok(unauthRootReads <= 1, `the cookie opened the wall after at most one 401 retry, got ${unauthRootReads}`)
-    assert.match(r.detail, /client row\(s\) register their graph id/)
+    assert.match(r.detail, /client-graph: 2 checked · 0 unavailable \(HTTP n\) · 0 not-attempted-or-unreachable/)
     // REDACTION: the reported detail never carries the token value (fb-16/fb-35).
     assert.ok(!r.detail.includes(FIXTURE_TOKEN), 'the launch token must never surface in the canary detail')
   } finally {

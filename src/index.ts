@@ -165,10 +165,15 @@ export interface Config {
    *  served page and verifies every client-graph row's
    *  `/plugins/<id>/client.js` bundle registers that row's id — the loader
    *  invariant a "loaded without registering" GUI break violates. A boot
-   *  that serves no `__DSH_BOOT__` (non-web surface) passes trivially. */
+   *  that serves no `__DSH_BOOT__` (non-web surface) passes trivially.
+   *  fb-1908: the phase GATES on readiness and SETTLES (bounded backoff +
+   *  re-probe of the not-proven rows only), and its verdict separates THREE
+   *  counters — `checked` · `unavailable (HTTP n)` ·
+   *  `not-attempted-or-unreachable` — so a server that is merely still coming
+   *  up is never reported as a broken bundle. */
   canaryClientCheck: boolean
   /** Whole-phase budget (ms) for the canary's client-graph validation
-   *  (default 15000). */
+   *  (default 15000) — the settle window, not a per-request timeout. */
   canaryClientTimeoutMs: number
   /** Post-boot AGENT-LIVENESS check (default true): every non-retired member
    *  of the deepartments catalog (posts.json) must appear alive in the

@@ -485,14 +485,50 @@ export interface ClientGraphRow {
 export interface ClientGraphCheckResult {
   ok: boolean
   detail: string
-  /** Number of rows whose bundle registered their graph id (when ok). */
+  /** Rows whose bundle registered their graph id (the OK class). */
   checked?: number
+  /** PROVEN failures: rows answered HTTP n (non-200) + rows served a bundle
+   *  registering no/another id — the "unsatisfiable" class. */
+  failed?: number
+  /** Rows whose bundle answered a non-200 HTTP status ("bundle unavailable
+   *  (HTTP n)") — a real, provable failure. */
+  unavailable?: number
+  /** Rows served HTTP 200 whose bundle registers no/another id (the P1
+   *  "loaded without registering" class). */
+  unsatisfiable?: number
+  /** Rows NOT proven either way: no HTTP answer (timeout / ECONNREFUSED /
+   *  abort) or never probed (the phase deadline ran out). fb-1908: this class
+   *  is NEVER a broken bundle — it is the "the server is not serving yet"
+   *  signature the pre-fix check reported as «bundle fetch failed». */
+  notAttempted?: number
+  /** Per-row failure notes (PROVEN failures first, unreachable rows apart). */
+  notes?: string[]
 }
 
 /** Default whole-phase budget for the client-graph validation. */
 export const DEFAULT_CLIENT_CHECK_TIMEOUT_MS = 15_000
-/** Cap on failure notes embedded in one check detail (keep alert text tight). */
-const MAX_FAILURE_NOTES = 3
+/** First settle wait before re-probing a row/the page (doubles each pass). */
+export const CLIENT_SETTLE_MIN_MS = 200
+/** Cap of one settle backoff step. */
+export const CLIENT_SETTLE_MAX_STEP_MS = 2_000
+/** Per-REQUEST cap (ms) of one page/row fetch inside the phase budget: a
+ *  single hanging request must never eat the settle window (fb-1908b). */
+export const CLIENT_FETCH_TIMEOUT_MS = 1_500
+/** Fraction of the phase budget the READINESS GATE may spend on its own
+ *  (probing one row until the bundle surface answers at all), so a single
+ *  permanently hanging row can never starve the full sweep. */
+export const CLIENT_READINESS_BUDGET_FRACTION = 0.5
+/**
+ * Floor (ms) before the PROVEN-failure stopping rule may fire. A stable
+ * proven set over one 200 ms backoff is WEAK evidence that «the abort is
+ * real»; giving the not-yet-answered rows a bounded fair read (this floor)
+ * before concluding keeps the rule from ending the settle in the very window
+ * it exists for — while still bounding the wait far below the whole budget.
+ */
+export const CLIENT_PROVEN_SETTLE_FLOOR_MS = 2_000
+/** Cap on unproven row ids spotlighted in the separated unproven class (the
+ *  PROVEN failures are NEVER capped: the verdict IS the finding, fb-1908c). */
+const MAX_UNPROVEN_IDS = 3
 
 /**
  * Parse the `__DSH_BOOT__` client graph out of a served boot HTML document.
@@ -581,8 +617,36 @@ export function clientBundleRegistersId(bundleSource: string, rowId: string): bo
  *
  * A boot that serves NO boot graph (non-web surface) passes — there are no
  * client rows to validate. Bounded by `timeoutMs` (whole phase; each fetch is
- * capped at 3s of the remaining budget). Runs with an injectable `fetchUrl`
- * so tests serve fixture HTML/bundles without a real dsh instance.
+ * capped at CLIENT_FETCH_TIMEOUT_MS of the remaining budget). Runs with an
+ * injectable `fetchUrl` so tests serve fixture HTML/bundles without a real dsh
+ * instance.
+ *
+ * fb-1908 — THE PHASE SETTLES, AND IT SEPARATES THE THREE CLASSES. The
+ * pre-fix phase fetched each row ONCE, right after the liveness probe — i.e.
+ * in the window where "the plugin web server is still starting" and "the
+ * bundle is broken" are INDISTINGUISHABLE (both reach `fetchUrlDefault`'s
+ * `null`). The measured consequence: the canary reported 7/31/36 unresolved
+ * rows on a quiet tree, while the same tree, once mature, served all 9 bundles
+ * with 200 + the right id in 2-11 ms (43 rows × 11 ms ≈ 0.5 s — the 15 s
+ * budget was never the constraint; PATIENCE was). So the phase now:
+ *
+ *  1. GATES ON READINESS — probes ONE row (and the boot page) until the
+ *     bundle surface answers AT ALL (≥1 HTTP answer), within
+ *     `timeoutMs × CLIENT_READINESS_BUDGET_FRACTION`, and only then sweeps;
+ *  2. SETTLES — an unfinished sweep waits a bounded backoff (200 ms → 2 s)
+ *     and re-probes ONLY the NOT-PROVEN rows (a proven 404/foreign-id row is
+ *     never re-probed: the finding cannot change);
+ *  3. STOPPING RULE — once a REAL failure has latched, two consecutive sweeps
+ *     with the SAME proven-failure set end the phase (an abort that is REAL
+ *     resolves in ≤2 sweeps, so the canary keeps its meaning instead of
+ *     eventually timing out). While NOTHING is proven yet the phase does NOT
+ *     stop early: waiting is exactly the point.
+ *
+ * The verdict counts THREE differentiated classes (never one `null` bucket):
+ * `checked` (row OK) · `unavailable (HTTP n)` + `unsatisfiable` (PROVEN
+ * failures — what aborts the restart) · `notAttempted` (no HTTP answer / never
+ * probed — a server that is not serving yet, reported APART and never as
+ * «bundle fetch failed»).
  */
 export async function checkClientGraph(
   port: number,
@@ -606,48 +670,254 @@ export async function checkClientGraph(
   // behind the same auth wall. The cookie is bound to the `127.0.0.1:<port>`
   // authority the exchange used, so the Host must stay pinned to it.
   const headers = cookie === undefined ? undefined : { host: `127.0.0.1:${port}`, cookie }
-  const page = await fetchUrl(origin + '/', Math.min(3000, remaining()), headers)
-  if (!page) {
-    return { ok: false, detail: 'client-graph: boot HTML unavailable (ephemeral instance unreachable after liveness)' }
+  /** One bounded request inside the phase budget. */
+  const request = (url: string): Promise<{ status: number; body: string } | null> =>
+    fetchUrl(url, Math.min(CLIENT_FETCH_TIMEOUT_MS, Math.max(1, remaining())), headers)
+
+  // ── 1. READINESS GATE: the boot page must answer AT ALL before the sweep.
+  //    While it returns NO answer (timeout / ECONNREFUSED / abort — the
+  //    pre-fix code's «boot HTML unavailable»), the phase WAITS with a bounded
+  //    backoff instead of declaring a failure on a server that is still coming
+  //    up: waiting IS the fix (the 15 s budget was never the constraint).
+  const readinessBudget = Math.max(1, Math.floor(timeoutMs * CLIENT_READINESS_BUDGET_FRACTION))
+  const readinessDeadline = Math.min(deadline, Date.now() + readinessBudget)
+  const page = await settleUntilAnswered(origin + '/', request, readinessDeadline)
+  if (page === null) {
+    return {
+      ok: false,
+      detail:
+        'client-graph: 0 checked · 0 unavailable (HTTP n) · 0 not-attempted-or-unreachable — ' +
+        `the boot page never answered within ${readinessBudget}ms of the ${timeoutMs}ms phase budget ` +
+        '(the instance serves nothing yet: this is NOT a broken bundle, and NOT proof the tree is sane)',
+      checked: 0,
+      ...ZERO_COUNTS,
+    }
   }
   if (page.status !== 200) {
-    return { ok: false, detail: `client-graph: boot HTML returned HTTP ${page.status}` }
+    return {
+      ok: false,
+      detail: `client-graph: boot HTML returned HTTP ${page.status} ANSWER (the server answered, but not with a boot page)`,
+      checked: 0,
+      ...ZERO_COUNTS,
+    }
   }
   let graph: { rev: string; entries: ClientGraphRow[] } | null = null
   try {
     graph = extractBootGraph(page.body)
   } catch (err) {
-    return { ok: false, detail: String(err) }
+    return { ok: false, detail: String(err), checked: 0, ...ZERO_COUNTS }
   }
   if (!graph) {
-    return { ok: true, detail: 'client-graph: no __DSH_BOOT__ client graph served — nothing to validate' }
+    return {
+      ok: true,
+      detail: 'client-graph: no __DSH_BOOT__ client graph served — nothing to validate',
+      checked: 0,
+      ...ZERO_COUNTS,
+    }
   }
-  const failures: string[] = []
+
+  // ── 2/3. THE SETTLE SWEEP. A row's verdict is latched the moment it is
+  //    PROVEN (HTTP n / served-but-wrong-id); only NOT-YET-ANSWERED rows are
+  //    re-probed, so one sweep's findings can never be undone by a later one.
+  const rows = graph.entries
+  const verdicts: (ClientGraphVerdict | undefined)[] = new Array(rows.length)
+  const urls = rows.map((row) => new URL(row.url, origin).href)
+  const startedAt = Date.now()
+  let settleMs = CLIENT_SETTLE_MIN_MS
+  let previousProven: string | undefined
+  for (;;) {
+    for (let i = 0; i < rows.length; i++) {
+      if (verdicts[i] !== undefined) continue // PROVEN in an earlier sweep
+      const left = remaining()
+      if (left <= 0) break // the rest stay unproven (reported, never fatal)
+      const res = await request(urls[i])
+      if (res === null) continue // no answer — retried by the next sweep
+      if (res.status !== 200) {
+        verdicts[i] = { kind: 'unavailable', status: res.status }
+        continue
+      }
+      verdicts[i] = clientBundleRegistersId(res.body, rows[i].id)
+        ? { kind: 'ok' }
+        : { kind: 'unsatisfiable', got: registeredBundleId(res.body) }
+    }
+    const counts = countVerdicts(verdicts)
+    if (counts.notAttempted === 0) break // every row resolved
+    const proven = provenSignature(verdicts, rows)
+    // STOPPING RULE — ONLY once a REAL failure has latched AND the not-yet-
+    // answered rows have had a bounded fair read (CLIENT_PROVEN_SETTLE_FLOOR_MS):
+    // the same PROVEN set in two consecutive sweeps then means the abort is real
+    // and waiting adds no signal. An EMPTY proven set means «nothing proven
+    // YET» — waiting is precisely what the fix is for — and firing the rule
+    // 200 ms after the FIRST real failure would end the settle in the very
+    // window it exists for, leaving a still-starting row reported as unproven.
+    if (
+      counts.failed > 0 &&
+      previousProven !== undefined &&
+      proven === previousProven &&
+      Date.now() - startedAt >= CLIENT_PROVEN_SETTLE_FLOOR_MS
+    ) {
+      break
+    }
+    previousProven = proven
+    const wait = Math.min(settleMs, Math.max(0, remaining()))
+    if (wait <= 0) break // budget spent — the remaining rows stay unproven
+    await sleep(wait)
+    settleMs = Math.min(CLIENT_SETTLE_MAX_STEP_MS, settleMs * 2)
+  }
+  const counts = countVerdicts(verdicts)
+  const notes: string[] = []
+  for (let i = 0; i < rows.length; i++) {
+    const v = verdicts[i]
+    if (v?.kind === 'unavailable') {
+      notes.push(`row "${rows[i].id}" bundle unavailable (HTTP ${v.status} at ${urls[i]})`)
+    } else if (v?.kind === 'unsatisfiable') {
+      notes.push(
+        `row "${rows[i].id}" bundle served but ${
+          v.got === undefined ? 'registers no id' : `registers "${v.got}" instead of "${rows[i].id}"`
+        }`,
+      )
+    }
+  }
+  const result: ClientGraphCheckResult = {
+    ok: counts.failed === 0 && !(counts.checked === 0 && counts.notAttempted > 0),
+    detail: '',
+    checked: counts.checked,
+    failed: counts.failed,
+    unavailable: counts.unavailable,
+    unsatisfiable: counts.unsatisfiable,
+    notAttempted: counts.notAttempted,
+    notes,
+  }
+  // The THREE differentiated counters (fb-1908a), rendered in EVERY verdict so
+  // the class boundary is never lost: `checked` · `unavailable (HTTP n)` ·
+  // `not-attempted-or-unreachable`; the wrong-id class (HTTP 200 that
+  // registers no/another id) is its own explicitly labelled sub-count, so no
+  // row is left uncounted and no row is ever folded into the wrong class.
+  const counters =
+    `${counts.checked} checked · ${counts.unavailable} unavailable (HTTP n) · ` +
+    `${counts.notAttempted} not-attempted-or-unreachable`
+  const unprovenTail = (): string => {
+    const unprovenIds = rows.filter((_, i) => verdicts[i] === undefined).map((r) => r.id)
+    const shown = unprovenIds.slice(0, MAX_UNPROVEN_IDS).join(', ')
+    const more = unprovenIds.length > MAX_UNPROVEN_IDS ? ` (+${unprovenIds.length - MAX_UNPROVEN_IDS} more)` : ''
+    return (
+      ` — NOT a failure: ${counts.notAttempted} row(s) not attempted-or-unreachable ` +
+      `(no HTTP answer inside the ${timeoutMs}ms budget — the instance was still bringing its ` +
+      `bundle surface up, which is NOT a broken bundle: ${shown}${more})`
+    )
+  }
+  // A PARTIAL verdict (some rows proven OK, none failed, some unproven) is a
+  // PASS whose unproven rows are named — never silently dropped.
+  if (counts.failed === 0 && counts.checked > 0) {
+    result.detail = `client-graph: ${counters}` + (counts.notAttempted > 0 ? unprovenTail() : '')
+    return result
+  }
+  // NOTHING PROVEN AT ALL (no failure proven, no row verified): the sweep
+  // could not read the bundle surface — `ok:false` because a canary that
+  // verified ZERO rows must never report a clean pass (a zero without a
+  // positive control does not prove the tree is sane), and the detail says
+  // exactly that: this is NOT a broken bundle, it is an unverified tree.
+  if (counts.failed === 0) {
+    result.detail =
+      `client-graph: ${counters} — UNPROVEN, NOT broken: no row could be verified inside the ` +
+      `${timeoutMs}ms budget, so this is NOT proof the tree is sane either` +
+      unprovenTail()
+    return result
+  }
+  // (c) NO TRUNCATION OF REAL FAILURES: every PROVEN failure is named (the
+  //     verdict IS the finding); the unproven class is reported APART, as its
+  //     own count + ids, never aggregated into a «first N + and M more» that
+  //     mixes the two classes.
+  result.detail =
+    `client-graph: ${counters}` +
+    (counts.unsatisfiable > 0
+      ? ` · ${counts.unsatisfiable} unsatisfiable (HTTP 200 that registers no/another id)`
+      : '') +
+    ` — ${counts.failed} of ${rows.length} row(s) unsatisfiable — ${notes.join('; ')}`
+  if (counts.notAttempted > 0) result.detail += unprovenTail()
+  return result
+}
+
+/** One row's verdict inside the settle sweep (latched once PROVEN). */
+type ClientGraphVerdict =
+  | { kind: 'ok' }
+  /** The bundle answered a non-200 status — a REAL failure. */
+  | { kind: 'unavailable'; status: number }
+  /** HTTP 200 but the envelope registers no/another id — the P1 class. */
+  | { kind: 'unsatisfiable'; got: string | undefined }
+
+const ZERO_COUNTS: Pick<ClientGraphCheckResult, 'failed' | 'unavailable' | 'unsatisfiable' | 'notAttempted'> = {
+  failed: 0,
+  unavailable: 0,
+  unsatisfiable: 0,
+  notAttempted: 0,
+}
+
+function countVerdicts(verdicts: readonly (ClientGraphVerdict | undefined)[]): {
+  checked: number
+  unavailable: number
+  unsatisfiable: number
+  failed: number
+  notAttempted: number
+} {
   let checked = 0
-  for (const row of graph.entries) {
-    const left = remaining()
-    if (left <= 0) {
-      return { ok: false, detail: `client-graph: timed out before validating all ${graph.entries.length} row(s)` }
-    }
-    const url = new URL(row.url, origin).href
-    const res = await fetchUrl(url, Math.min(3000, left), headers)
-    if (!res) {
-      failures.push(`row "${row.id}" bundle fetch failed at ${url}`)
-    } else if (res.status !== 200) {
-      failures.push(`row "${row.id}" bundle unavailable (HTTP ${res.status} at ${url})`)
-    } else if (!clientBundleRegistersId(res.body, row.id)) {
-      const got = registeredBundleId(res.body)
-      failures.push(`row "${row.id}" bundle served but ${got === undefined ? 'registers no id' : `registers "${got}" instead of "${row.id}"`}`)
-    } else {
-      checked += 1
-    }
+  let unavailable = 0
+  let unsatisfiable = 0
+  let notAttempted = 0
+  for (const v of verdicts) {
+    if (v === undefined) notAttempted += 1
+    else if (v.kind === 'ok') checked += 1
+    else if (v.kind === 'unavailable') unavailable += 1
+    else unsatisfiable += 1
   }
-  if (failures.length > 0) {
-    const notes = failures.slice(0, MAX_FAILURE_NOTES).join('; ')
-    const more = failures.length > MAX_FAILURE_NOTES ? ` (and ${failures.length - MAX_FAILURE_NOTES} more)` : ''
-    return { ok: false, detail: `client-graph: ${failures.length} of ${graph.entries.length} row(s) unsatisfiable — ${notes}${more}` }
+  return { checked, unavailable, unsatisfiable, failed: unavailable + unsatisfiable, notAttempted }
+}
+
+/**
+ * The PROVEN-failure signature of one sweep: a stable identity of the rows
+ * latched as real failures. Two consecutive sweeps with the SAME signature
+ * mean the abort is REAL and waiting adds no signal — the stopping rule.
+ */
+function provenSignature(
+  verdicts: readonly (ClientGraphVerdict | undefined)[],
+  rows: readonly ClientGraphRow[],
+): string {
+  const parts: string[] = []
+  for (let i = 0; i < verdicts.length; i++) {
+    const v = verdicts[i]
+    if (v === undefined || v.kind === 'ok') continue
+    parts.push(v.kind === 'unavailable' ? `${rows[i].id}:HTTP${v.status}` : `${rows[i].id}:id=${String(v.got)}`)
   }
-  return { ok: true, detail: `client-graph: ${checked} client row(s) register their graph id`, checked }
+  return parts.join('|')
+}
+
+/** Bounded backoff sleep (never throws on a 0/negative span). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)))
+}
+
+/**
+ * Probe ONE URL until it ANSWERS (any HTTP status) or `deadline` passes.
+ * The readiness gate's primitive: a request that returns `null` is the
+ * «not serving yet» signature (timeout / ECONNREFUSED / abort), so the phase
+ * waits with a bounded backoff (CLIENT_SETTLE_MIN_MS → CLIENT_SETTLE_MAX_STEP_MS)
+ * instead of spending its whole budget probing a surface that is still coming
+ * up. Returns the ANSWER when one arrives, else null.
+ */
+async function settleUntilAnswered(
+  url: string,
+  request: (url: string) => Promise<{ status: number; body: string } | null>,
+  deadline: number,
+): Promise<{ status: number; body: string } | null> {
+  let wait = CLIENT_SETTLE_MIN_MS
+  for (;;) {
+    const res = await request(url)
+    if (res !== null) return res
+    const left = deadline - Date.now()
+    if (left <= 0) return null
+    await sleep(Math.min(wait, left))
+    wait = Math.min(CLIENT_SETTLE_MAX_STEP_MS, wait * 2)
+  }
 }
 
 // --- post-boot runtime checks ("el canary se queda corto" hardening) ---------
