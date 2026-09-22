@@ -185,6 +185,80 @@ export function resolveExecTarget(
   }
 }
 
+/** One composed dump row: its config block, rendered as YAML source lines. */
+interface DumpRowConfig {
+  /** `config:` body lines of the row, at their ORIGINAL indentation. */
+  body: string[]
+  /** Indent of the FIRST body line (the config keys' own indent). */
+  keyIndent: number
+}
+
+/**
+ * Parse a `--dump-config` entry list into `{ rowId → its config body }`, so a
+ * stateDir patch row can be emitted carrying the row's WHOLE original config
+ * (see `buildPatchContent`). Structural parse, same family as
+ * `deriveLiveStateDirOverrides` / `checkDumpConfigCoherent`: `- id:` rows at
+ * column 0, everything indented under them belongs to that row. A row with no
+ * `config:` block yields an EMPTY body (nothing to preserve). Null/undefined/
+ * empty/malformed dumps yield an empty map — the caller then falls back to the
+ * legacy stateDir-only row, never a throw.
+ */
+export function parseDumpRowConfigs(dumpYaml: string | null | undefined): Map<string, DumpRowConfig> {
+  const out = new Map<string, DumpRowConfig>()
+  if (dumpYaml === null || dumpYaml === undefined) return out
+  const text = String(dumpYaml)
+  if (text.trim() === '') return out
+  let rowId: string | undefined
+  let inConfig = false
+  let body: string[] | undefined
+  const flush = (): void => {
+    if (rowId !== undefined && body !== undefined) out.set(rowId, { body, keyIndent: configKeyIndent(body) })
+  }
+  for (const raw of text.trimEnd().split('\n')) {
+    const line = raw.replace(/\s+$/, '')
+    if (line.trim() === '') continue
+    if (line.trimStart().startsWith('#')) continue
+    const row = line.match(/^- id: (\S+)/)
+    if (row) {
+      flush()
+      rowId = row[1]
+      inConfig = false
+      body = undefined
+      continue
+    }
+    if (rowId === undefined) continue
+    // A NESTED `- id:` row (group child) starts its own row: close the current.
+    if (/^ {2,}- /.test(line)) {
+      if (inConfig && body !== undefined) body.push(line)
+      continue
+    }
+    // Row-level keys (`name:`, `disabled:`, …) close the config block.
+    if (/^ {2}\S/.test(line)) {
+      if (/^ {2}config:\s*$/.test(line)) {
+        inConfig = true
+        body = []
+      } else {
+        inConfig = false
+      }
+      continue
+    }
+    if (inConfig && body !== undefined) body.push(line)
+  }
+  flush()
+  return out
+}
+
+/** The indent of a config body's own keys (the shallowest non-blank line). */
+function configKeyIndent(body: readonly string[]): number {
+  let min = Number.POSITIVE_INFINITY
+  for (const line of body) {
+    if (line.trim() === '') continue
+    const indent = line.match(/^( *)\S/)?.[1].length ?? 0
+    if (indent < min) min = indent
+  }
+  return Number.isFinite(min) ? min : 0
+}
+
 /**
  * Compose the canary `--patch` overlay YAML (a top-level list of id-targeted
  * rows, the same shape the dev profile uses; a patch row replaces the row's
@@ -201,8 +275,24 @@ export function resolveExecTarget(
  * or empty value resolves under `tmpDir` (e.g. `deepartments: ''` →
  * `stateDir: "<tmpDir>/deepartments"`), so the canary never writes live board
  * state from other plugins either.
+ *
+ * 🔴 A stateDir-override row MUST carry the target row's WHOLE config.
+ * `applyEntryPatches` (dsh-app-boot) applies a patch as
+ * `for (const [key, value] of Object.entries(overrides)) target[key] = value`
+ * — i.e. `config` REPLACES the row's whole config object, it does NOT merge.
+ * So a row emitted as `{config: {stateDir}}` DELETES every other key of that
+ * row. On the 0.1.5 profile that is fatal: `- id: deepartments` requires
+ * `config.org`, so an override that drops `org` makes the ephemeral fail to
+ * load its plugin tree at all — no web server, no `dsh web:` line, no cookie,
+ * and the client-graph then reports an unrelated 401/permanently-unready boot
+ * (measured: `deepartments` override ⇒ no boot; `dshd-core` override — whose
+ * own config is just `stateDir` ⇒ boots). `dumpYaml` is therefore the
+ * ephemeral's OWN composed dump: `buildPatchContent` re-emits each overridden
+ * row's original config with ONLY the `stateDir` line replaced. When no dump
+ * is supplied (unit callers, or a hook that captured no stdout) the legacy
+ * stateDir-only row is emitted, exactly as before.
  */
-export function buildPatchContent(tmpDir: string, overrides: Record<string, string> = {}): string {
+export function buildPatchContent(tmpDir: string, overrides: Record<string, string> = {}, dumpYaml?: string | null): string {
   // The smart-restart row is emitted FIRST as one complete self-contained
   // block: always `enabled: false` (the canary must never write a marker or
   // notice into the live state dir), plus its own optional redirected stateDir
@@ -220,18 +310,138 @@ export function buildPatchContent(tmpDir: string, overrides: Record<string, stri
     '  config:',
     '    enabled: false',
   ]
+  const rowConfigs = dumpYaml === undefined || dumpYaml === null ? new Map<string, DumpRowConfig>() : parseDumpRowConfigs(dumpYaml)
   if ('smart-restart' in overrides) {
     // Quote the path (YAML-safe for spaces, e.g. /tmp paths with spaces).
     lines.push(`    stateDir: "${resolveOverrideDir(overrides['smart-restart'], 'smart-restart', tmpDir)}"`)
   }
   for (const [key, dir] of Object.entries(overrides)) {
     if (key === 'smart-restart') continue
+    const stateDir = resolveOverrideDir(dir, key, tmpDir)
+    const preserved = rowConfigs.get(key)
     lines.push(`- id: ${key}`)
     lines.push('  config:')
-    // Quote the path (YAML-safe for spaces, e.g. /tmp paths with spaces).
-    lines.push(`    stateDir: "${resolveOverrideDir(dir, key, tmpDir)}"`)
+    if (preserved === undefined || preserved.body.length === 0) {
+      // No composed config to preserve (legacy path / row without a config
+      // block): emit the stateDir-only row exactly as before.
+      lines.push(`    stateDir: "${stateDir}"`)
+      continue
+    }
+    // Re-emit the row's WHOLE config with ONLY its own stateDir line replaced
+    // (see the patch-semantics note above: dropping the sibling keys would make
+    // the ephemeral fail to load — e.g. `deepartments` requires `config.org`).
+    const replaced = replaceStateDirLine(preserved, stateDir)
+    if (replaced === null) {
+      // The row carries no OWN stateDir key (an inherited one): the stateDir
+      // would have been CREATED by the override — preserve the config and add
+      // the key at the body's own key indent.
+      const pad = ' '.repeat(preserved.keyIndent)
+      lines.push(`${pad}stateDir: "${stateDir}"`)
+      lines.push(...preserved.body)
+      continue
+    }
+    lines.push(...replaced)
   }
-  return `${lines.join('\n')}\n`
+  // The private session store (see SESSION_STORE_ROW): the ephemeral must never
+  // share the live `dshHomePath('sessions')` store, which no stateDir redirect
+  // reaches and which makes the boot die on SessionAlreadyExistsError.
+  return `${lines.join('\n')}\n` + buildSessionStoreRow(tmpDir, rowConfigs)
+}
+
+/**
+ * The row whose session store must NOT be shared with the live daemon.
+ *
+ * `session-persistence-jsonl` stores sessions under
+ * `root: !!js dshHomePath('sessions')` — the LIVE Harness home, which no
+ * `stateDir` redirect reaches (it is not a stateDir row). A canary ephemeral
+ * that shares it boots the REAL org (as soon as the config-preservation fix
+ * lets the tree load at all) and then dies on
+ * `SessionAlreadyExistsError: session "head-research-head" already exists`
+ * (measured: fatal at T+14.8s, 5ms after the `dsh web:` line) — taking the
+ * whole client-graph phase with it, since the process is gone before a single
+ * bundle can be read.
+ *
+ * The session ROOT is an ordinary config key of an ordinary row, so the
+ * canary's patch REPLACES it with a private per-canary path (the same
+ * tmpDir overlay every other redirect uses, removed with the tmpDir). That is
+ * strictly safer than sharing the live store, and it makes the canary validate
+ * a boot that ACTUALLY STARTS ITS ORG — 55/55 client rows verified (vs 5/55
+ * when the org could not start), at zero cost to the live instance.
+ */
+const SESSION_STORE_ROW = 'session-persistence-jsonl'
+/** The session row's own config key holding its store path. */
+const SESSION_STORE_KEY = 'root'
+
+/**
+ * Emit the private-session-store row for the ephemeral: the session row with
+ * its `root` replaced by `<tmpDir>/sessions`, every sibling key preserved.
+ * Returns '' when the composed dump has no such row (a composition without the
+ * jsonl session store): nothing to isolate, and inventing a row would be a
+ * guess.
+ */
+function buildSessionStoreRow(tmpDir: string, rowConfigs: Map<string, DumpRowConfig>): string {
+  const preserved = rowConfigs.get(SESSION_STORE_ROW)
+  if (preserved === undefined || preserved.body.length === 0) return ''
+  const replaced = replaceConfigPathLine(preserved, SESSION_STORE_KEY, join(tmpDir, 'sessions'))
+  if (replaced === null) return ''
+  return [`- id: ${SESSION_STORE_ROW}`, '  config:', ...replaced].join('\n') + '\n'
+}
+
+/**
+ * Replace ONE `<indent><key>: <value>` line inside a preserved config body,
+ * preserving every sibling key and the original indentation. Returns null when
+ * the body carries no such key at the body's own key indent (an unset/inherited
+ * value — then there is no live path to redirect).
+ */
+function replaceConfigPathLine(row: DumpRowConfig, key: string, value: string): string[] | null {
+  const pad = ' '.repeat(row.keyIndent)
+  const prefix = `${pad}${key}:`
+  const out: string[] = []
+  let replaced = false
+  for (let i = 0; i < row.body.length; i++) {
+    const line = row.body[i]
+    if (!replaced && line.startsWith(prefix)) {
+      out.push(`${pad}${key}: "${value}"`)
+      replaced = true
+      // A block scalar / `!!js` value on the following lines is dropped with it.
+      let j = i + 1
+      while (j < row.body.length && /^\s+\S/.test(row.body[j])) j++
+      i = j - 1
+      continue
+    }
+    out.push(line)
+  }
+  return replaced ? out : null
+}
+
+/**
+ * Replace the row's OWN `stateDir:` line inside a preserved config body,
+ * keeping every sibling key and the original indentation. Returns null when
+ * the body carries no `stateDir` key at its key indent (an inherited row).
+ */
+function replaceStateDirLine(row: DumpRowConfig, stateDir: string): string[] | null {
+  const pad = ' '.repeat(row.keyIndent)
+  const prefix = `${pad}stateDir:`
+  const out: string[] = []
+  let replaced = false
+  for (let i = 0; i < row.body.length; i++) {
+    const line = row.body[i]
+    if (!replaced && line.startsWith(prefix)) {
+      // A block scalar (`stateDir: >-`) keeps the value on the FOLLOWING
+      // (deeper-indented) lines: drop them so no stale path survives.
+      const inline = line.slice(prefix.length).trim()
+      out.push(`${pad}stateDir: "${stateDir}"`)
+      replaced = true
+      if (inline === '' || inline === '>' || inline === '|' || inline === '>-' || inline === '|-' || inline === '>+' || inline === '|+') {
+        let j = i + 1
+        while (j < row.body.length && /^\s+\S/.test(row.body[j])) j++
+        i = j - 1
+      }
+      continue
+    }
+    out.push(line)
+  }
+  return replaced ? out : null
 }
 
 function resolveOverrideDir(dir: string, key: string, tmpDir: string): string {
@@ -377,6 +587,52 @@ export function probeStatusHealthy(status: number | undefined, authenticated = f
 export const LAUNCH_TOKEN_QUERY = 'token'
 /** The startup line the web runtime prints its authenticated URL on. */
 const WEB_URL_LINE = /^dsh web:\s*(\S+)/
+/**
+ * Capture budget (ms) for the launch-token line, MEASURED on the 0.1.5 tree.
+ *
+ * The line is printed once the boot SETTLES (the loader finishes and the
+ * web-server + connection services exist), not when the process starts. Two
+ * timestamps were measured on the EPHEMERAL itself (not on the live daemon),
+ * 3 runs of the profile the canary boots:
+ *
+ *   (α) the page first ANSWERS — any status (this is the event the liveness
+ *       hybrid contract waits for): T+11.9s / T+12.5s / T+11.9s (HTTP 404,
+ *       then 401 once the auth wall is up);
+ *   (β) the `dsh web:` line carrying the token is PRINTED: T+12.5s / T+12.9s /
+ *       T+12.4s ⇒ **β−α = 405–508ms**.
+ *
+ * So the two events are NOT the same instant — the code comment's «the SAME
+ * event liveness waits for» is an approximation that holds only to within half
+ * a second — but they are ADJACENT: the line follows the answer by ~0.5s, not
+ * by seconds. That is what makes a FLOOR the right shape here (see below) and
+ * why reordering the phases would buy nothing while costing the authenticated
+ * liveness contract.
+ *
+ * The pre-fix slice was 2s, i.e. it could never see the line on this tree — the
+ * capture silently came up empty and the client-graph then aborted a healthy
+ * tree on its 401. The default `canaryTimeoutMs` is 45s, so 20s covers the
+ * measured settle (7.1s of margin over the worst run) while the HALF-WINDOW cap
+ * guarantees the liveness prober keeps at least half the window.
+ */
+export const CANARY_CAPTURE_BUDGET_MS = 20_000
+/**
+ * Grace (ms) the capture keeps polling AFTER the instance first answers the
+ * hybrid liveness contract (200/401).
+ *
+ * MEASURED: the line follows the first answer by 405–508ms (3 runs on the
+ * ephemeral), so this grace is ~10x the observed gap — enough margin for jitter
+ * while still bounding a tree that answers but never prints (it cannot burn the
+ * whole capture budget).
+ */
+export const CANARY_CAPTURE_ANSWER_GRACE_MS = 5_000
+/**
+ * How long the capture waits for a TRANSCRIPT SOURCE to exist before giving up
+ * on an unreadable/absent stdout file (a hook that carries no transcript, or a
+ * spawn that did not redirect stdout). The default spawn creates the file
+ * before it returns, so this only fires for callers that have no transcript at
+ * all — declared best-effort, never a hard block.
+ */
+export const CANARY_CAPTURE_NO_TRANSCRIPT_MS = 2_000
 
 /**
  * Extract the launch token from ONE line of the web runtime's stdout.
@@ -413,6 +669,95 @@ export function extractLaunchToken(stdout: string, port: number): string | null 
 }
 
 /**
+ * WHY the transcript yielded no token — the exit-A witness (fb-2309).
+ *
+ * `parseLaunchTokenFromLine` rejects in five places and `extractLaunchToken`
+ * walks the transcript returning a bare `null`, so «the line was never
+ * printed» and «it was printed but failed ONE of five checks» were the SAME
+ * observable. This record names the condition instead.
+ *
+ * 🔴 REDACTION RULE (the token is never logged, reported or returned — the
+ * module's standing contract): every field derived from `match[1]` — the URL
+ * string that CARRIES the token — is published as a BOOLEAN PREDICATE against
+ * the expected value, never as a value, and never as a list/comparison/hash.
+ * A predicate against what we already expected reveals nothing new, whereas a
+ * derived VALUE (protocol, hostname, printed port) is an oracle function of a
+ * string that contains the secret and could partition a candidate space.
+ * COUNTERS are published as numbers: counting does not verify, comparing does.
+ */
+export interface LaunchTokenWitness {
+  /** The transcript source existed at all (a hook with no transcript cannot capture). */
+  stdoutExists: boolean
+  /** Size of the transcript read (a counter — useful to see a file that never grew). */
+  stdoutBytes: number
+  /** Lines matching the `/^dsh web:/` marker: 0 ⇒ the line was NOT printed. */
+  webLineCount: number
+  /** Of the `dsh web:` lines seen, the ones whose payload parsed as a URL. */
+  urlParseableCount: number
+  /** Predicate (`:305`): the first parseable URL is `http:`. */
+  protocolIsHttp?: boolean
+  /** Predicate (`:307`): its hostname is loopback. */
+  hostnameIsLoopback?: boolean
+  /** Predicate (`:308`): its port equals the port the canary REQUESTED. */
+  portMatchesRequested?: boolean
+  /** The port the canary asked for (`--port <requestedPort>`); the printed one is never published. */
+  requestedPort: number
+  /** Counter (`:310`): how many `token` query params the URL carries (must be exactly 1). */
+  tokenParams?: number
+}
+
+/**
+ * Build the exit-A witness from a captured transcript, WITHOUT extracting or
+ * revealing the token. Pure and total: never throws, and every derived value is
+ * reduced to a predicate or a count before it leaves this function.
+ */
+export function launchTokenWitness(stdout: string | null, port: number): LaunchTokenWitness {
+  const text = stdout ?? ''
+  const lines = text === '' ? [] : text.split('\n')
+  const witness: LaunchTokenWitness = {
+    stdoutExists: stdout !== null,
+    stdoutBytes: Buffer.byteLength(text, 'utf8'),
+    webLineCount: 0,
+    urlParseableCount: 0,
+    requestedPort: port,
+  }
+  for (const line of lines) {
+    // Count the MARKER lines only — the payload is never kept.
+    if (!WEB_URL_LINE.test(line.trim())) continue
+    witness.webLineCount += 1
+    if (witness.urlParseableCount > 0) continue // first parseable URL wins
+    let url: URL
+    try {
+      url = new URL(WEB_URL_LINE.exec(line.trim())![1])
+    } catch {
+      continue // the lookalike "opening the default browser" notice
+    }
+    witness.urlParseableCount += 1
+    // Predicates only: the URL string carries the token, so no derived value
+    // (protocol string, hostname, printed port) may leave this function.
+    witness.protocolIsHttp = url.protocol === 'http:'
+    witness.hostnameIsLoopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '::1' || url.hostname === '[::1]'
+    witness.portMatchesRequested = Number(url.port) === port
+    witness.tokenParams = url.searchParams.getAll(LAUNCH_TOKEN_QUERY).length
+  }
+  return witness
+}
+
+/** Render the witness as the ONE log fragment for exit A (no secret, no URL). */
+function renderWitness(w: LaunchTokenWitness): string {
+  const parts = [
+    `stdout: ${w.stdoutExists ? `${w.stdoutBytes}B` : 'absent'}`,
+    `dsh-web lines: ${w.webLineCount}`,
+    `url-parseable: ${w.urlParseableCount}`,
+  ]
+  if (w.urlParseableCount > 0) {
+    parts.push(`protocol-http: ${w.protocolIsHttp}`, `host-loopback: ${w.hostnameIsLoopback}`)
+    parts.push(`port-matches-requested(${w.requestedPort}): ${w.portMatchesRequested}`, `token-params: ${w.tokenParams}`)
+  }
+  return parts.join(' · ')
+}
+
+/**
  * Exchange the launch token ONCE for the authority-bound browser-session
  * cookie.
  *
@@ -426,11 +771,47 @@ export function extractLaunchToken(stdout: string, port: number): string | null 
  * the signed payload). A non-303 means the token was refused: null, and the
  * caller falls back to the unauthenticated liveness.
  */
-export async function exchangeLaunchTokenForCookie(
+/** Why the token→cookie exchange produced no cookie (fb-2309: five causes, one observable). */
+export type LaunchTokenExchangeOutcome =
+  /** The 303 + a shape-valid `set-cookie` arrived: the wall can be opened. */
+  | 'cookie'
+  /** The runtime answered, but not with the 303 the exchange contract requires. */
+  | 'status'
+  /** The 303 arrived, but the runtime exposes no `Headers.getSetCookie` reader. */
+  | 'no-get-set-cookie'
+  /** The 303 arrived and the reader ran, yet no shape-valid `set-cookie` pair was found. */
+  | 'no-set-cookie'
+  /** The request itself failed (refused / aborted / timeout). */
+  | 'request-failed'
+
+export interface LaunchTokenExchangeResult {
+  /** The `NAME=VALUE` cookie, or null when the exchange produced none. */
+  cookie: string | null
+  /** Which branch the exchange took. */
+  outcome: LaunchTokenExchangeOutcome
+  /** The HTTP status observed, or undefined when the request never answered. */
+  status?: number
+  /** How many `set-cookie` values the reader returned (`undefined` when no reader exists). */
+  setCookieCount?: number
+}
+
+/**
+ * Exchange the launch token ONCE for the authority-bound browser-session
+ * cookie, REPORTING WHICH BRANCH the exchange took.
+ *
+ * This is the diagnostic sibling of `exchangeLaunchTokenForCookie` (which keeps
+ * its `string | null` contract for callers/tests): fb-2309 measured that FIVE
+ * different causes — no line captured, a non-303 answer, a runtime without
+ * `Headers.getSetCookie`, a 303 whose `set-cookie` fails the shape filter, and a
+ * request failure — all collapse into the same `null`, and from the outside all
+ * of them look like the same unrelated 401 abort. The caller logs the branch so
+ * the next reader can tell them apart without a debugger.
+ */
+export async function exchangeLaunchTokenForCookieDetailed(
   baseUrl: string,
   token: string,
   timeoutMs: number,
-): Promise<string | null> {
+): Promise<LaunchTokenExchangeResult> {
   const url = new URL(baseUrl)
   url.pathname = '/'
   url.search = ''
@@ -442,22 +823,52 @@ export async function exchangeLaunchTokenForCookie(
       headers: { host: new URL(baseUrl).host },
       signal: AbortSignal.timeout(timeoutMs),
     })
-    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []
+    const hasReader = typeof res.headers.getSetCookie === 'function'
+    const setCookies = hasReader ? res.headers.getSetCookie() : []
     try {
       await res.body?.cancel()
     } catch {
       // body already gone — nothing to drain
     }
-    if (res.status !== 303) return null
+    if (res.status !== 303) return { cookie: null, outcome: 'status', status: res.status }
+    if (!hasReader) return { cookie: null, outcome: 'no-get-set-cookie', status: res.status, setCookieCount: 0 }
     for (const raw of setCookies) {
       const pair = raw.split(';', 1)[0]?.trim()
       // A cookie NAME=VALUE only: a token echo can never pass this shape.
-      if (pair && /^[^=;,\s]+=[^=;,\s]*$/.test(pair)) return pair
+      if (pair && /^[^=;,\s]+=[^=;,\s]*$/.test(pair)) {
+        return { cookie: pair, outcome: 'cookie', status: res.status, setCookieCount: setCookies.length }
+      }
     }
-    return null
+    return { cookie: null, outcome: 'no-set-cookie', status: res.status, setCookieCount: setCookies.length }
   } catch {
-    return null
+    return { cookie: null, outcome: 'request-failed' }
   }
+}
+
+/**
+ * Exchange the launch token ONCE for the authority-bound browser-session
+ * cookie.
+ *
+ * The runtime answers `GET /?token=…` with 303 + `set-cookie` and the cookie
+ * is WHATWG-authority-bound (its name and signed audience derive from the
+ * request authority), so the exchange and every later read must carry the
+ * SAME `127.0.0.1:<port>` authority — hence the explicit `Host` header. Node's
+ * `fetch` keeps no cookie jar, so `redirect: 'manual'` is used and the
+ * `set-cookie` is read off the 303 by hand. The body is drained and never
+ * read; only the cookie NAME=VALUE pair is returned (never the token, never
+ * the signed payload). A non-303 means the token was refused: null, and the
+ * caller falls back to the unauthenticated liveness.
+ *
+ * Thin wrapper over {@link exchangeLaunchTokenForCookieDetailed} so the
+ * diagnostic branch reporting is available to the canary without changing this
+ * function's long-standing `string | null` contract.
+ */
+export async function exchangeLaunchTokenForCookie(
+  baseUrl: string,
+  token: string,
+  timeoutMs: number,
+): Promise<string | null> {
+  return (await exchangeLaunchTokenForCookieDetailed(baseUrl, token, timeoutMs)).cookie
 }
 
 // --- client boot-graph validation (the P1 GUI lesson, 2026-08-29) ------------
@@ -1430,6 +1841,28 @@ async function probeLivenessDefault(port: number, timeoutMs: number, cookie?: st
   }
 }
 
+/**
+ * ONE bounded liveness sample (the non-blocking sibling of
+ * `probeLivenessDefault`): returns the HTTP status, or undefined when the
+ * instance did not answer. The capture uses it to notice that the boot has
+ * started serving — the event the `dsh web:` line follows.
+ */
+async function probeOnceDefault(port: number, timeoutMs: number, cookie?: string): Promise<number | undefined> {
+  const headers = cookie === undefined ? undefined : { host: `127.0.0.1:${port}`, cookie }
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { headers, signal: AbortSignal.timeout(timeoutMs) })
+    const status = res.status
+    try {
+      await res.body?.cancel()
+    } catch {
+      // body already gone — nothing to drain
+    }
+    return status
+  } catch {
+    return undefined // ECONNREFUSED (not yet up) or per-attempt timeout
+  }
+}
+
 async function fetchUrlDefault(
   url: string,
   timeoutMs: number,
@@ -1664,7 +2097,15 @@ export async function runCanary(
       return { status: 'failed', detail: `dump-config failed: ${discovery.stderr}` }
     }
     const derivedOverrides = deriveLiveStateDirOverrides(discovery.stdout, tmpDir)
-    writeFileSync(patchPath, buildPatchContent(tmpDir, { ...cfg.canaryStateDirOverrides, ...derivedOverrides }), 'utf8')
+    writeFileSync(
+      patchPath,
+      // The DISCOVERY dump is the ephemeral's OWN composed config: passing it
+      // makes every override row re-emit its original config with only the
+      // `stateDir` line replaced, so a stateDir redirect can never drop a
+      // sibling key the row requires (the `deepartments`/`org` fatality).
+      buildPatchContent(tmpDir, { ...cfg.canaryStateDirOverrides, ...derivedOverrides }, discovery.stdout),
+      'utf8',
+    )
 
     const preflight = dumpConfig(target.binary, target.profile, patchPath)
     if (!preflight.ok) {
@@ -1691,32 +2132,135 @@ export async function runCanary(
     //    the line survives. The token is exchanged ONCE for the
     //    authority-bound browser-session cookie and the cookie is what the
     //    checks below carry — the token value is never logged nor returned.
-    //    Capture is BEST-EFFORT, bounded by the liveness window: a tree that
-    //    prints no URL (or a hook carrying no transcript) leaves `cookie`
-    //    undefined and every check falls back to its unauthenticated
-    //    contract, so no install is newly blocked by this step.
+    //    Capture is BEST-EFFORT but BOUNDED BY MEASUREMENT, and it REPORTS the
+    //    branch it took (fb-2309): a tree that prints no URL (or a hook
+    //    carrying no transcript) leaves `cookie` undefined and every check
+    //    falls back to its unauthenticated contract — and the reason is now
+    //    visible in the log instead of collapsing into the same 401 abort.
     const readBootStdout = hooks.readBootStdout ?? (() => readFileSafe(join(tmpDir, BOOT_STDOUT_FILE)))
     const livenessDeadline = Date.now() + cfg.canaryTimeoutMs
     // The capture waits for the boot to settle — the SAME event liveness waits
-    // for — so it may only spend a BOUNDED SLICE of the window. Spending the
-    // whole window here would leave the prober a zero budget and fail a tree
-    // that simply prints no URL line.
-    const captureDeadline = Math.min(livenessDeadline, Date.now() + Math.min(2000, Math.floor(cfg.canaryTimeoutMs / 2)))
+    // for — so it uses a MEASURED budget (see CANARY_CAPTURE_BUDGET_MS: the line
+    // lands at ~T+12.4-12.9s on the EPHEMERAL, ~0.5s after the page first
+    // answers) capped at half the window, so the prober keeps the rest.
+    //
+    // THE FLOOR (why the shape is «give each phase a guaranteed share» and not
+    // «widen the slice»): the capture and the prober are SEQUENTIAL consumers of
+    // ONE deadline — the prober inherits whatever the capture leaves
+    // (`livenessBudget = livenessDeadline - now`). Handing the capture the whole
+    // window would leave the prober ~1ms and declare a healthy tree unsound.
+    // The half-window cap below is what makes the guarantee STRUCTURAL: whatever
+    // `canaryTimeoutMs` is, the capture can never take more than half, so the
+    // prober always keeps ≥50% of the window to reach (α) — measured at
+    // T+11.9-12.5s, which 25s of the default 45s covers with ~12s to spare.
+    // The capture's EFFECTIVE budget, derived from the configured window and
+    // named in the log so «the wait was not short» carries its own number: with
+    // the default 45s it is 20s, but a caller with `canaryTimeoutMs = 10s`
+    // gets 5s, and a reader of that run must see which one applied.
+    const captureBudgetMs = Math.max(0, Math.min(CANARY_CAPTURE_BUDGET_MS, Math.floor(cfg.canaryTimeoutMs / 2)))
+    const captureDeadline = Math.min(
+      livenessDeadline,
+      // (a) THE FLOOR: the prober's share is reserved BEFORE the capture starts.
+      livenessDeadline - Math.floor(cfg.canaryTimeoutMs / 2),
+      Date.now() + captureBudgetMs,
+    )
+    const budgetReport = `budget ${captureBudgetMs}ms (min(${CANARY_CAPTURE_BUDGET_MS}ms, ½·${cfg.canaryTimeoutMs}ms))`
     let cookie: string | undefined
+    let captureReport = 'no token line captured'
+    const captureStartedAt = Date.now()
+    let answeredAt: number | undefined
+    let sawTranscript = false
+    let exchangeResult: LaunchTokenExchangeResult | undefined
+    // THE capture budget's own dimension, measured at runtime: `spawn → the
+    // first transcript line carrying the token`. After the fix ties the capture
+    // to the boot's own event (not the clock), branch A below can ONLY mean
+    // «the line never arrived» — so this number is the one that says whether a
+    // future budget is right, and it is logged on the happy path too.
+    let tokenLineAtMs: number | undefined
+    // The last transcript read, kept ONLY so exit A can report WHICH condition
+    // failed. It is reduced to predicates/counters (never the URL or token) by
+    // `launchTokenWitness` before anything is logged.
+    let lastTranscript: string | null = null
     for (;;) {
-      const token = extractLaunchToken(readBootStdout() ?? '', port)
-      if (token) {
-        // The line lands once the boot settles; the exchange is one 303.
-        cookie = (await exchangeLaunchTokenForCookie(
-          `http://127.0.0.1:${port}`,
-          token,
-          Math.min(3000, Math.max(1, livenessDeadline - Date.now())),
-        )) ?? undefined
-        break
+      const stdout = readBootStdout()
+      if (stdout !== null) {
+        sawTranscript = true
+        lastTranscript = stdout
+        const token = extractLaunchToken(stdout, port)
+        if (token) {
+          tokenLineAtMs = Date.now() - captureStartedAt
+          // The line lands once the boot settles; the exchange is one 303.
+          exchangeResult = await exchangeLaunchTokenForCookieDetailed(
+            `http://127.0.0.1:${port}`,
+            token,
+            Math.min(3000, Math.max(1, livenessDeadline - Date.now())),
+          )
+          cookie = exchangeResult.cookie ?? undefined
+          captureReport = `\`dsh web:\` line found ${tokenLineAtMs}ms after the spawn`
+          break
+        }
       }
       const left = captureDeadline - Date.now()
-      if (left <= 0) break // no token line — hybrid liveness below
+      if (left <= 0) {
+        // Name the branch by what was actually missing: a caller with no
+        // readable transcript never had a chance to see the line, and saying
+        // "no line within Nms" for it would misattribute the cause.
+        captureReport = sawTranscript
+          ? `no \`dsh web:\` line within ${Date.now() - captureStartedAt}ms of the spawn`
+          : 'no stdout transcript to read (capture hook carried none)'
+        break
+      }
+      // A caller with NO transcript at all (hook carrying none / spawn without
+      // stdout redirection) can never capture: do not spend the boot's window.
+      if (!sawTranscript && Date.now() - captureStartedAt >= CANARY_CAPTURE_NO_TRANSCRIPT_MS) {
+        captureReport = 'no stdout transcript to read (capture hook carried none)'
+        break
+      }
+      // The line follows the instance ANSWERING; once it answers, keep polling
+      // only for a bounded grace instead of the whole capture budget.
+      if (answeredAt !== undefined && Date.now() - answeredAt >= CANARY_CAPTURE_ANSWER_GRACE_MS) {
+        captureReport = `no \`dsh web:\` line within ${CANARY_CAPTURE_ANSWER_GRACE_MS}ms of the boot answering HTTP`
+        break
+      }
+      if (answeredAt === undefined) {
+        answeredAt = (await probeOnceDefault(port, Math.min(250, Math.max(1, left)))) === undefined ? undefined : Date.now()
+      }
       await new Promise((resolve) => setTimeout(resolve, Math.min(100, left)))
+    }
+    // ONE log line, ONE branch (fb-2309): the reason a run has no cookie is
+    // stated, never silent. The token/cookie VALUES are never logged.
+    // The loop has exactly three exits and each names itself: (A) the wait
+    // ended with no line — the ONLY remaining witness that the line never
+    // arrived, since the capture is now tied to the boot's own event instead of
+    // a clock slice; (B) the line was found and the exchange ran — the outcome
+    // separates status≠303 / no-get-set-cookie / no-set-cookie / request-failed;
+    // (C) the happy path, which still reports WHEN the line landed (the number
+    // that sizes this budget, measured on the ephemeral itself).
+    if (cookie !== undefined) {
+      console.log(`[smart-restart] canary launch-token capture: cookie obtained (${captureReport}; ${budgetReport})`)
+    } else if (exchangeResult !== undefined) {
+      console.log(
+        `[smart-restart] canary launch-token capture: token line found${tokenLineAtMs === undefined ? '' : ` ${tokenLineAtMs}ms after the spawn`}, ` +
+          'exchange produced NO cookie — ' +
+          `exchange branch "${exchangeResult.outcome}"` +
+          (exchangeResult.status === undefined ? '' : ` (HTTP ${exchangeResult.status}`) +
+          (exchangeResult.setCookieCount === undefined ? ')' : `, ${exchangeResult.setCookieCount} set-cookie value(s))`) +
+          ' — the checks below run unauthenticated, and on an auth-walled tree the client-graph will report 401',
+      )
+    } else {
+      // Branch A: the ephemeral never yielded a USABLE `dsh web:` line. The
+      // WITNESS names WHICH condition failed (never printed vs. printed but
+      // rejected by one of the parser's five checks) without revealing a byte of
+      // the secret, and the BUDGET is published with its formula so the claim
+      // below carries its own number in EVERY regime — `canaryTimeoutMs` may be
+      // small enough that the wait really was shorter than the boot needs, and a
+      // reader of such a run must be able to see that instead of trusting a
+      // blanket assertion.
+      console.log(
+        `[smart-restart] canary launch-token capture: ${captureReport} [${budgetReport}] — witness {${renderWitness(launchTokenWitness(lastTranscript, port))}}; ` +
+          'this branch means the line was NOT USABLE; the checks below run unauthenticated; ' +
+          'on a tree with the 0.1.5 auth wall that surfaces as HTTP 401 in the client-graph',
+      )
     }
 
     // The prober keeps whatever budget the capture left, so the whole

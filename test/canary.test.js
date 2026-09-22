@@ -19,8 +19,10 @@ import {
   deriveExecStartParams,
   deriveLiveStateDirOverrides,
   exchangeLaunchTokenForCookie,
+  exchangeLaunchTokenForCookieDetailed,
   extractBootGraph,
   extractLaunchToken,
+  launchTokenWitness,
   parseLaunchTokenFromLine,
   parseCatalogMembers,
   pickFreePort,
@@ -1668,5 +1670,432 @@ test('runCanary e2e against a REAL auth-walled server: the exchange opens the wa
   } finally {
     await new Promise((resolve) => server.close(resolve))
     rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+// --- fb-2309: the canary could not validate a restart on the 0.1.5 tree -------
+//
+// Three defects, one observable (the same `client-graph: boot HTML returned
+// HTTP 401` abort). Measured on the live `deepartments-dev` profile:
+//   1. a stateDir-override patch row DROPPED the target row's sibling config
+//      keys (`config` REPLACES, it does not merge) ⇒ `deepartments` lost its
+//      required `org` ⇒ the ephemeral never loaded its tree;
+//   2. that tree boots its REAL org, whose sessions live in the LIVE
+//      `dshHomePath('sessions')` store — untouched by any stateDir redirect ⇒
+//      `SessionAlreadyExistsError: session "head-research-head"` killed the
+//      ephemeral 5 ms after the `dsh web:` line;
+//   3. the line only appears once the boot SETTLES (~T+13s), so the 2s capture
+//      slice could never see it.
+// These are the unit regressions for all three.
+
+test('fb-2309 (1): a stateDir override PRESERVES the target row config — a patch row must never drop a required sibling key', () => {
+  const dump = [
+    '- id: deepartments',
+    '  name: dsh-deepartments',
+    '  config:',
+    '    stateDir: .deepartments',
+    '    org:',
+    '      pacing:',
+    '        enabled: true',
+    '    quality:',
+    '      workerInspectProbability: 0.25',
+    '- id: dshd-core',
+    '  name: dshd-core',
+    '  config:',
+    '    stateDir: .deepartments',
+    '- id: tool-fs',
+    '  config:',
+    '    enabled: true',
+  ].join('\n')
+  const content = buildPatchContent('/tmp/dsh-canary-preserve', { deepartments: '', 'dshd-core': '' }, dump)
+  // The stateDir is redirected…
+  assert.ok(content.includes('    stateDir: "/tmp/dsh-canary-preserve/deepartments"'), content)
+  // …and EVERY sibling key survives (this is the fatality: org is REQUIRED).
+  assert.ok(/^- id: deepartments\n {2}config:\n(?: {4}.*\n)*? {4}org:\n {6}pacing:/m.test(content), `org must survive the override:\n${content}`)
+  assert.ok(content.includes('      workerInspectProbability: 0.25'), 'quality must survive too')
+  assert.ok(content.includes('    stateDir: "/tmp/dsh-canary-preserve/dshd-core"'), content)
+  // Without a dump (legacy callers) the stateDir-only row is still emitted.
+  const legacy = buildPatchContent('/tmp/dsh-canary-legacy', { deepartments: '' })
+  assert.ok(legacy.includes('- id: deepartments\n  config:\n    stateDir: "/tmp/dsh-canary-legacy/deepartments"'), legacy)
+})
+
+test('fb-2309 (2): the patch isolates the ephemeral SESSION store — the live `dshHomePath(sessions)` root is replaced by a per-canary path', () => {
+  const dump = [
+    '- id: session-persistence-jsonl',
+    '  name: "@deepseek-ai/dsh-session-persistence-jsonl"',
+    '  config:',
+    "    root: !!js dshHomePath('sessions')",
+    '- id: deepartments',
+    '  config:',
+    '    stateDir: .deepartments',
+  ].join('\n')
+  const content = buildPatchContent('/tmp/dsh-canary-sessions', { deepartments: '' }, dump)
+  const sessionBlock = '- id: session-persistence-jsonl\n  config:\n    root: "/tmp/dsh-canary-sessions/sessions"'
+  assert.ok(content.includes(sessionBlock), `the session store must be redirected into the tmpDir:\n${content}`)
+  assert.ok(!content.includes("dshHomePath('sessions')"), 'the live session root must NOT survive in the patch')
+  // No such row in the composition ⇒ nothing is invented.
+  const withoutRow = buildPatchContent('/tmp/dsh-canary-sessions2', { deepartments: '' }, '- id: deepartments\n  config:\n    stateDir: .deepartments\n')
+  assert.ok(!withoutRow.includes('session-persistence-jsonl'), withoutRow)
+})
+
+test('fb-2309 (3): the launch-token capture WAITS for the boot to settle (measured window, not the pre-fix 2s slice) and cedes to the prober', async () => {
+  // The line appears long after the pre-fix 2s slice: the capture must still
+  // find it, exchange it, and leave the prober a usable budget.
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'dsh-canary-settle-'))
+  let spawnAt = 0
+  let capturedAt = 0
+  let probedWith = null
+  const hooks = {
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41555,
+    dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+    spawnBoot: () => {
+      spawnAt = Date.now()
+      return { pid: 4560 }
+    },
+    readBootStdout: () => {
+      // The line lands 3s after the spawn — INSIDE the measured budget, but far
+      // OUTSIDE the pre-fix 2s slice.
+      capturedAt = Date.now()
+      return Date.now() - spawnAt >= 3000 ? `dsh web: http://127.0.0.1:41555/?token=${FIXTURE_TOKEN}\n` : ''
+    },
+    probeLiveness: async (port, timeoutMs, cookie) => {
+      probedWith = cookie ?? null
+      assert.ok(timeoutMs > 0, 'the prober must still have a budget after the capture')
+      return true
+    },
+    fetchUrl: async (url) => {
+      // Serve the REAL bundle surface: the boot page carries the graph, and
+      // each `/plugins/<id>/client.js` registers its own id (a stub returning
+      // HTML for a bundle would be a broken-bundle fixture, not this case).
+      const row = HEALTHY_GRAPH.entries.find((e) => url.endsWith(e.url) || url.includes(`/plugins/${e.id}/`))
+      if (row) return { status: 200, body: bundleFor(row.id) }
+      return { status: 200, body: bootHtml(HEALTHY_GRAPH) }
+    },
+    killProcessGroup: () => {},
+  }
+  try {
+    const r = await runCanary(
+      undefined,
+      {
+        ...baseCfg,
+        canaryTimeoutMs: 20000,
+        canaryPort: 41555,
+        canaryClientCheck: true,
+        canaryAgentCheck: false,
+        canaryPoolerCheck: false,
+        canaryMarkersCheck: false,
+      },
+      {},
+      hooks,
+    )
+    assert.equal(r.status, 'passed', r.detail)
+    assert.ok(Date.now() - spawnAt >= 3000, 'the capture really waited past the pre-fix 2s slice')
+    assert.ok(capturedAt - spawnAt >= 2900, `the line was only readable after ~3s, got ${capturedAt - spawnAt}ms`)
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('fb-2309 (b): the capture STATES its branch — no cookie is never silent', async () => {
+  // TWO callers, TWO different branches, and each is named: a hook with no
+  // transcript at all (fast, cannot ever capture) and a live file that simply
+  // never receives the line (the budget runs out). Both used to be a silent
+  // `cookie = undefined`.
+  const logs = []
+  const original = console.log
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  const cfg = {
+    ...baseCfg,
+    canaryTimeoutMs: 1500,
+    canaryPort: 41556,
+    canaryClientCheck: false,
+    canaryAgentCheck: false,
+    canaryPoolerCheck: false,
+    canaryMarkersCheck: false,
+  }
+  const hooks = (readBootStdout) => ({
+    execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+    pickFreePort: async () => 41556,
+    dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+    spawnBoot: () => ({ pid: 4561 }),
+    readBootStdout,
+    probeLiveness: async () => true,
+    killProcessGroup: () => {},
+  })
+  try {
+    // (i) no transcript at all.
+    await runCanary(undefined, cfg, {}, hooks(() => null))
+    // (ii) a transcript that never carries the line.
+    await runCanary(undefined, cfg, {}, hooks(() => 'boot chatter, no url line\n'))
+  } finally {
+    console.log = original
+  }
+  const captureLines = logs.filter((l) => l.includes('launch-token capture'))
+  assert.equal(captureLines.length, 2, `exactly ONE branch line per run, got ${JSON.stringify(logs)}`)
+  assert.match(captureLines[0], /no stdout transcript to read/)
+  assert.match(captureLines[1], /no `dsh web:` line within \d+ms of the spawn/)
+  for (const line of captureLines) {
+    assert.ok(!line.includes('token='), 'the token value must never be logged')
+  }
+})
+
+test('fb-2309 (b2): the exchange branch is named when the token WAS found but no cookie came back', async () => {
+  // The 303-without-a-readable-set-cookie branch: the line IS captured, the
+  // exchange fails, and the log must say WHICH branch failed.
+  const logs = []
+  const original = console.log
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (url.pathname === '/' && url.searchParams.get('token') !== null) {
+      res.writeHead(303, { location: '/' }) // 303 WITHOUT set-cookie
+      res.end()
+      return
+    }
+    res.writeHead(401, { 'content-type': 'text/plain' })
+    res.end('auth required\n')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  try {
+    await runCanary(
+      undefined,
+      { ...baseCfg, canaryTimeoutMs: 5000, canaryPort: port, canaryClientCheck: false, canaryAgentCheck: false, canaryPoolerCheck: false, canaryMarkersCheck: false },
+      {},
+      {
+        execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+        pickFreePort: async () => port,
+        dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+        spawnBoot: () => ({ pid: 4562 }),
+        readBootStdout: () => `dsh web: http://127.0.0.1:${port}/?token=${FIXTURE_TOKEN}\n`,
+        probeLiveness: async () => true,
+        killProcessGroup: () => {},
+      },
+    )
+  } finally {
+    console.log = original
+    await new Promise((resolve) => server.close(resolve))
+  }
+  const line = logs.find((l) => l.includes('launch-token capture'))
+  assert.ok(line !== undefined, `a capture branch line must be logged: ${JSON.stringify(logs)}`)
+  assert.match(line, /exchange produced NO cookie/)
+  assert.match(line, /exchange branch "no-set-cookie"/)
+  assert.ok(!line.includes(FIXTURE_TOKEN), 'the token value must never be logged')
+})
+
+test('fb-2309 (b3): branch A is UNAMBIGUOUS after the fix — no line means the line never ARRIVED, and the happy path reports WHEN it landed', async () => {
+  // After the capture is tied to the boot event instead of a 2s clock slice,
+  // the "wait expired" exit can only mean the ephemeral never printed a
+  // parseable `dsh web:` line. That is the surviving witness for cause (ii),
+  // and it must SAY so — otherwise the next no-cookie abort is mute again.
+  const logs = []
+  const original = console.log
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  try {
+    await runCanary(
+      undefined,
+      { ...baseCfg, canaryTimeoutMs: 1500, canaryPort: 41557, canaryClientCheck: false, canaryAgentCheck: false, canaryPoolerCheck: false, canaryMarkersCheck: false },
+      {},
+      {
+        execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+        pickFreePort: async () => 41557,
+        dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+        spawnBoot: () => ({ pid: 4563 }),
+        readBootStdout: () => 'boot chatter, no url line\n',
+        probeLiveness: async () => true,
+        killProcessGroup: () => {},
+      },
+    )
+  } finally {
+    console.log = original
+  }
+  const branchA = logs.find((l) => l.includes('launch-token capture'))
+  assert.ok(branchA !== undefined, JSON.stringify(logs))
+  assert.match(branchA, /no `dsh web:` line within \d+ms of the spawn/)
+  // The improved witness names the condition: here the marker never appeared.
+  assert.match(branchA, /witness \{stdout: \d+B · dsh-web lines: 0 · url-parseable: 0\}/)
+  assert.match(branchA, /the line was NOT USABLE/)
+  // …and the EFFECTIVE budget travels with it, with its formula: the claim
+  // «the wait was not short» must carry its own number in every regime.
+  assert.match(branchA, /\[budget 750ms \(min\(20000ms, ½·1500ms\)\)\]/)
+})
+
+test('fb-2309 (b4): the happy path reports the spawn→line instant — the number that sizes the capture budget', async () => {
+  // Measured on the live profile: the line lands ~12.6-13.7s after the spawn
+  // (the pre-fix 2s slice could never see it). The loop already samples it, so
+  // the run must publish it rather than making the next reader re-measure.
+  const logs = []
+  const original = console.log
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (url.pathname === '/' && url.searchParams.get('token') !== null) {
+      res.writeHead(303, { location: '/', 'set-cookie': 'dsh-auth-fixture=opaque' })
+      res.end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end(bootHtml(HEALTHY_GRAPH))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  const spawnAt = Date.now()
+  try {
+    await runCanary(
+      undefined,
+      { ...baseCfg, canaryTimeoutMs: 10000, canaryPort: port, canaryClientCheck: false, canaryAgentCheck: false, canaryPoolerCheck: false, canaryMarkersCheck: false },
+      {},
+      {
+        execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+        pickFreePort: async () => port,
+        dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+        spawnBoot: () => ({ pid: 4564 }),
+        // The line only becomes readable ~600ms after the spawn.
+        readBootStdout: () =>
+          Date.now() - spawnAt >= 600 ? `dsh web: http://127.0.0.1:${port}/?token=${FIXTURE_TOKEN}\n` : '',
+        probeLiveness: async () => true,
+        killProcessGroup: () => {},
+      },
+    )
+  } finally {
+    console.log = original
+    await new Promise((resolve) => server.close(resolve))
+  }
+  const happy = logs.find((l) => l.includes('cookie obtained'))
+  assert.ok(happy !== undefined, `the happy path must log its capture: ${JSON.stringify(logs)}`)
+  assert.match(happy, /cookie obtained \(`dsh web:` line found \d+ms after the spawn; budget \d+ms \(min\(20000ms, ½·10000ms\)\)\)/)
+  const ms = Number(happy.match(/line found (\d+)ms/)?.[1])
+  assert.ok(Number.isFinite(ms) && ms >= 600, `the reported instant must be the measured one, got ${ms}`)
+})
+
+test('fb-2309 (witness): exit A names WHICH condition failed — predicates and counters, never a byte of the secret', () => {
+  // `parseLaunchTokenFromLine` rejects in five places and `extractLaunchToken`
+  // returns a bare null, so «never printed» and «printed but rejected» were the
+  // same observable. The witness separates them WITHOUT leaking: every field
+  // derived from the URL string (which carries the token) is a PREDICATE
+  // against the expected value; only counters are numbers.
+  const PORT = 41234
+  const withToken = (url) => `dsh web: ${url}\n`
+
+  // (1) The marker never appeared at all ⇒ (β₁) not printed.
+  const none = launchTokenWitness('boot chatter\n[key-pooler] ready\n', PORT)
+  assert.equal(none.stdoutExists, true)
+  assert.equal(none.webLineCount, 0)
+  assert.equal(none.urlParseableCount, 0)
+  assert.equal(none.protocolIsHttp, undefined, 'no URL ⇒ no predicates at all')
+
+  // (2) Printed, but the payload is not a URL (the lookalike notice).
+  const notice = launchTokenWitness(withToken('opening the default browser'), PORT)
+  assert.equal(notice.webLineCount, 1)
+  assert.equal(notice.urlParseableCount, 0)
+
+  // (3) Printed with a non-loopback host ⇒ the predicate is false, the VALUE never appears.
+  const foreign = launchTokenWitness(withToken(`http://example.test:${PORT}/?token=${FIXTURE_TOKEN}`), PORT)
+  assert.equal(foreign.hostnameIsLoopback, false)
+  assert.equal(foreign.portMatchesRequested, true)
+  assert.equal(foreign.tokenParams, 1)
+
+  // (4) Printed with ANOTHER port than the one the canary requested (a (2b) cause).
+  const otherPort = launchTokenWitness(withToken(`http://127.0.0.1:${PORT + 1}/?token=${FIXTURE_TOKEN}`), PORT)
+  assert.equal(otherPort.portMatchesRequested, false)
+  assert.equal(otherPort.requestedPort, PORT, 'the REQUESTED port is published; the printed one never is')
+
+  // (5) Two token params instead of exactly one.
+  const twoTokens = launchTokenWitness(withToken(`http://127.0.0.1:${PORT}/?token=a&token=b`), PORT)
+  assert.equal(twoTokens.tokenParams, 2)
+
+  // (6) The healthy shape ⇒ every predicate true.
+  const good = launchTokenWitness(withToken(`http://127.0.0.1:${PORT}/?token=${FIXTURE_TOKEN}`), PORT)
+  assert.equal(good.protocolIsHttp, true)
+  assert.equal(good.hostnameIsLoopback, true)
+  assert.equal(good.portMatchesRequested, true)
+  assert.equal(good.tokenParams, 1)
+
+  // (7) NO SECRET LEAKS: the token, the URL string, and the printed host/port
+  // never appear in the serialized witness.
+  const serialized = JSON.stringify(launchTokenWitness(withToken(`http://127.0.0.1:${PORT + 7}/?token=${FIXTURE_TOKEN}`), PORT))
+  assert.ok(!serialized.includes(FIXTURE_TOKEN), 'the token must never appear in the witness')
+  assert.ok(!serialized.includes('example.test'), 'a non-loopback host VALUE must never appear')
+  assert.ok(!serialized.includes(`:${PORT + 7}`), 'the printed port must never appear')
+  assert.ok(!serialized.includes('dsh web:'), 'the raw line must never appear')
+})
+
+test('fb-2309 (witness-log): exit A logs the witness, and the logged line still carries no secret', async () => {
+  const logs = []
+  const original = console.log
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  const PORT = 41559
+  try {
+    await runCanary(
+      undefined,
+      { ...baseCfg, canaryTimeoutMs: 1500, canaryPort: PORT, canaryClientCheck: false, canaryAgentCheck: false, canaryPoolerCheck: false, canaryMarkersCheck: false },
+      {},
+      {
+        execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+        pickFreePort: async () => PORT,
+        dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+        spawnBoot: () => ({ pid: 4566 }),
+        // A line WAS printed, on the WRONG port ⇒ (2b) with its condition named.
+        readBootStdout: () => `dsh web: http://127.0.0.1:${PORT + 5}/?token=${FIXTURE_TOKEN}\n`,
+        probeLiveness: async () => true,
+        killProcessGroup: () => {},
+      },
+    )
+  } finally {
+    console.log = original
+  }
+  const line = logs.find((l) => l.includes('launch-token capture'))
+  assert.ok(line !== undefined, JSON.stringify(logs))
+  assert.match(line, /dsh-web lines: 1/)
+  assert.match(line, /url-parseable: 1/)
+  assert.match(line, new RegExp(`port-matches-requested\\(${PORT}\\): false`))
+  assert.match(line, /token-params: 1/)
+  assert.ok(!line.includes(FIXTURE_TOKEN), 'the token must never be logged')
+  assert.ok(!line.includes(`:${PORT + 5}`), 'the printed port must never be logged')
+})
+
+test('fb-2309 (floor): the capture can NEVER starve the liveness prober — the floor is structural, not a widened slice', async () => {
+  // Measured on the ephemeral: the page first ANSWERS (α) at T+11.9-12.5s and
+  // the `dsh web:` line is PRINTED (β) 405-508ms later. Capture and prober are
+  // SEQUENTIAL consumers of ONE deadline (the prober inherits what the capture
+  // leaves), so the fix must reserve the prober's share instead of widening the
+  // capture slice — giving the capture the whole window would leave the prober
+  // ~1ms and declare a HEALTHY tree unsound (the false negative this fix must
+  // not trade for).
+  //
+  // This pins the invariant for ANY configured window: whatever the capture
+  // spends, the prober still receives at least half of `canaryTimeoutMs`.
+  for (const canaryTimeoutMs of [2000, 10_000, 45_000]) {
+    let proberBudget = null
+    await runCanary(
+      undefined,
+      { ...baseCfg, canaryTimeoutMs, canaryPort: 41558, canaryClientCheck: false, canaryAgentCheck: false, canaryPoolerCheck: false, canaryMarkersCheck: false },
+      {},
+      {
+        execStartOfUnit: () => '/usr/bin/dsh --profile dev',
+        pickFreePort: async () => 41558,
+        dumpConfig: () => ({ ok: true, stderr: '', stdout: PATCHED_DUMP }),
+        spawnBoot: () => ({ pid: 4565 }),
+        // A transcript that NEVER carries the line: the capture burns its whole
+        // budget, which is the worst case for the prober's share.
+        readBootStdout: () => 'boot chatter, no url line\n',
+        probeLiveness: async (port, timeoutMs) => {
+          proberBudget = timeoutMs
+          return true
+        },
+        killProcessGroup: () => {},
+      },
+    )
+    assert.ok(proberBudget !== null, `the prober must run (canaryTimeoutMs=${canaryTimeoutMs})`)
+    // A bounded slack is required by construction: the capture polls in ≤100ms
+    // steps, so it can overshoot its own deadline by up to one step. The
+    // invariant that matters — and that a future «widen the slice» change would
+    // break loudly — is that the prober keeps ~half the window instead of ~1ms.
+    const CAPTURE_POLL_SLACK_MS = 150
+    assert.ok(
+      proberBudget >= Math.floor(canaryTimeoutMs / 2) - CAPTURE_POLL_SLACK_MS,
+      `the prober must keep ~half the window: got ${proberBudget}ms of ${canaryTimeoutMs}ms`,
+    )
   }
 })
