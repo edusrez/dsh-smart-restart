@@ -103,6 +103,19 @@ The default notice (English) reads:
 
 When a `reason` was recorded by `smart_restart`, it is appended (`… reason: <reason>.`) before the resume instruction. The previous-boot/downtime segment is omitted when no previous boot time is known, and the whole text is fully customizable via the `notice` config (see below).
 
+Since **v0.6.0** (unreleased) the interrupted list is **sealed per session**. The list is composed **by session, never by post**, so a seat whose session rotated can legitimately appear **twice** — on 2026-09-22 the live notice carried both the then-current `head-quality-head-a352f359-…` and its rotated-out predecessor `head-quality-head-9e1cc8b2-…`, rendered identically as `(main)`, which made it impossible to tell the seat's holder from the outgoing session. Each entry now carries a **seat seal** resolved from the catalog:
+
+| Label | Meaning |
+| ----- | ------- |
+| `[seat <postId>]` | This session is the **current** session of that catalog row. |
+| `[seat <postId> superseded by <sessionId>]` | This session is **no longer the seat's holder**; the named session superseded it. |
+| `[seat <postId> (retired post)]` | The row that lists this session is retired. |
+| `[not a catalog incumbent]` | No row of the measured catalog accounts for this session. |
+
+**The seal is additive, never a gate.** A session that is no longer the incumbent is **still notified and still delivered to** — its write is made **attributable**, not blocked. (Blocking it would have destroyed the only channel that carried state across a rotated-out quality-head's incarnations — fb-2418/fb-2419.) The same seal is appended to the boot log's `interrupted sessions at shutdown:` and `interrupted heads (resume recipients):` lines.
+
+Both catalog documents are consulted — `posts.json` (`<postId>` rows) and `hosts.json` (`host-<id>` rows). Resolving against `posts.json` alone would mis-seal the live **host** session as "not a catalog incumbent". When **neither** document can be read, **no seal is produced at all** and the labels keep their pre-v0.6.0 shape: "could not measure the catalog" is never rendered as the positive claim "this session is not a member".
+
 ## The `smart_restart` tool
 
 Registered via `ctx.tools.register` in `apply` (so it is available to agent sessions) when `toolEnabled` is true (the default). It lets the main agent restart DSH itself through systemd.

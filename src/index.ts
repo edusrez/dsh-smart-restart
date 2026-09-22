@@ -24,7 +24,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { spawn } from 'node:child_process'
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 // Loads the cordis event-module augmentation (agent/* events) from dsh-agent.
 import type {} from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -44,6 +44,7 @@ import {
   parseCgroupUnit,
   parsePendingNotice,
   parseShutdownNotice,
+  resolveSessionSeals,
   selectsAgent,
   shutdownTarget,
   waitForIdle,
@@ -52,6 +53,7 @@ import {
   type ShutdownSession,
   type SmartRestartParams,
   type SmartRestartResult,
+  type SessionSeal,
   type WaitForIdleResult,
 } from './boot.js'
 import { DEFAULT_RUNTIME_STATE_DIR, runCanary, type CanaryResult } from './canary.js'
@@ -110,10 +112,12 @@ export interface SmartRestartOutcome extends SmartRestartResult {
   /** Other sessions that were mid-turn when a guard-blocked restart was
    *  refused (absent when the restart proceeded / nothing was in flight). */
   inFlight?: string[]
-  /** How long a `wait:true` deferral actually lasted (ms) — the ACCUMULATED
-   *  total of every wait stage of the call (the guard-stage deferral + the
-   *  post-canary re-check), never just the last one. Absent when no `wait` was
-   *  requested. FAILED waits carry it too (honest accounting). */
+  /** What a `wait:true` deferral CHARGED to the wait budget (ms) — the
+   *  ACCUMULATED total of every wait stage of the call (the guard-stage
+   *  deferral + the post-canary re-check), never just the last one. Each stage
+   *  charges at most its own cap, so a `setTimeout` overshoot of a few ms is
+   *  NOT counted: exact as a CHARGE, not a raw clock sample. Absent when no
+   *  `wait` was requested; FAILED waits carry it too (honest accounting). */
   waitedMs?: number
   /** Present + true ONLY on a `wait:true` deferral that spent its cap with
    *  sessions still mid-turn (the refusal then says so in `error`). */
@@ -262,6 +266,19 @@ export function shouldReRaiseSignal(signal: NodeJS.Signals): boolean {
 
 const moduleRequire = createRequire(import.meta.url)
 
+/**
+ * Read a text file, or return null when it is absent/unreadable. Used ONLY for
+ * the fb-2418 seal's catalog sources: an unreadable catalog is "not measured"
+ * (no seal is fabricated) — never an empty roster and never a boot failure.
+ */
+function readFileSafe(path: string): string | null {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return null
+  }
+}
+
 /** Best-effort DSH version; never lets a resolution failure crash the host. */
 function discoverDshVersion(): string | undefined {
   try {
@@ -388,6 +405,11 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   let interruptedSessions: ShutdownSession[] = []
   let interruptedHeadsList: string[] = []
   let shutdownNotice: ShutdownNotice | null = null
+  // fb-2418 (b) — the per-session seat seal, resolved ONCE from the catalog and
+  // consumed by every render path of the notice (the main notice's interrupted
+  // list + the interrupted-heads' resume notice). Empty when no catalog could
+  // be measured, in which case labels render exactly as before this change.
+  let seals = new Map<string, SessionSeal>()
   try {
     shutdownNotice = parseShutdownNotice(readFileSync(shutdownPath, 'utf8'))
   } catch {
@@ -405,12 +427,37 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
       shutdownNotice.sessions,
       config.ignoredSessionPrefixes,
     )
+    // fb-2418 (b) — THE SEAL: the notice is composed BY SESSION, so a seat
+    // whose session rotated can appear TWICE (measured 2026-09-22T17:48:34Z:
+    // the incumbent `a352f359` AND its outgoing predecessor `9e1cc8b2`, both
+    // rendered `(main)`). Resolve every interrupted session's seat from the
+    // catalog documents (BOTH posts.json and hosts.json — posts.json alone
+    // would mis-seal the live host session) so each label is ATTRIBUTABLE.
+    // This is a seal, NOT a gate: nothing here blocks or filters a session —
+    // the outgoing emitter's write/notification remains fully effective, it
+    // only stops being indistinguishable from the incumbent's.
+    seals = new Map(
+      resolveSessionSeals(
+        [...new Set([...interruptedSessions.map((s) => s.id), ...interruptedHeadsList])],
+        {
+          postsRaw: readFileSafe(config.canaryCatalogPath),
+          hostsRaw: readFileSafe(join(dirname(config.canaryCatalogPath), 'hosts.json')),
+        },
+      ).map((seal) => [seal.sessionId, seal]),
+    )
     console.log(
       '[smart-restart] interrupted sessions at shutdown:',
-      interruptedSessions.map((s) => s.id).join(', '),
+      interruptedSessions.map((s) => `${s.id} ${seals.get(s.id)?.label ?? ''}`.trim()).join(', '),
     )
     if (interruptedHeadsList.length > 0) {
-      console.log('[smart-restart] interrupted heads (resume recipients):', interruptedHeadsList.join(', '))
+      // fb-2418 (b) — the resume-recipient line is sealed too: it is the line a
+      // human reads when asking "who was woken, and were they still the seat?".
+      console.log(
+        '[smart-restart] interrupted heads (resume recipients):',
+        interruptedHeadsList
+          .map((id) => `${id} ${seals.get(id)?.label ?? ''}`.trim())
+          .join(', '),
+      )
     }
   }
   if (!pinnedTarget && shutdownNotice) {
@@ -566,8 +613,12 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
   // child (worker); a killed worker not yet resumed is listed by id alone.
   const describeInterrupted = (id: string): string => {
     const agent = ctx.agents.get(SessionId(id))
-    if (!agent) return id
-    return agentIsRoot(agent) ? `${id} (main)` : `${id} (worker)`
+    const label = !agent ? id : agentIsRoot(agent) ? `${id} (main)` : `${id} (worker)`
+    // fb-2418 (b) — append the seat seal so a session that is no longer the
+    // post's incumbent is ATTRIBUTABLE in the notice itself (the write/notice
+    // is never suppressed: the seal only names the seat and its holder).
+    const seal = seals.get(id)
+    return seal ? `${label} ${seal.label}` : label
   }
 
   // The combined human label for every session the shutdown cut (heads +

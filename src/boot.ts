@@ -517,3 +517,200 @@ export function interruptedHeads(
     .filter(({ id }) => ignoredByPrefix(id, prefixes))
     .map(({ id }) => id)
 }
+
+/**
+ * fb-2418 (b) — the SEAL of the resume notice: per-session seat attribution.
+ *
+ * THE DEFECT THIS SEALS (measured 2026-09-22, fb-2418). The resume notice lists
+ * interrupted sessions BY SESSION, never BY POST: on 2026-09-22T17:48:34Z the
+ * live notice carried `head-quality-head-a352f359-…` (the post's CURRENT
+ * session) AND `head-quality-head-9e1cc8b2-…` (its ROTATED-OUT predecessor) in
+ * the same list, both rendered as `(main)`. The system therefore has NO concept
+ * of "incumbent" when it composes the list, and the reader of the notice cannot
+ * tell the titular seat from the outgoing session.
+ *
+ * THE FIX IS A SEAL, NOT A BLOCK — the host's adjudicated decision. The outgoing
+ * emitter is NOT prevented from being notified or from writing (that write was
+ * the ONLY channel that delivered state across the QH's incarnations, fb-2419);
+ * its writing is made ATTRIBUTABLE instead: every session in the notice gets a
+ * seal naming the seat it belongs to, and whether that seat still lists it. So
+ * `[seat quality-head]` (the incumbent) is distinguishable from
+ * `[seat quality-head superseded by head-quality-head-a352f359-…]` (the
+ * outgoing predecessor), and a session no catalog row lists reads
+ * `[not a catalog incumbent]` — a signature, never a silenced write.
+ *
+ * WHAT "CATALOG" MEANS HERE (both documents, measured live): `posts.json` maps
+ * `<postId> → { sessionId, previousChildId?, retired? }` and `hosts.json` maps
+ * `host-<id> → { sessionId, previousSessionId?, retired?, ... }`. BOTH must be
+ * consulted: resolving against `posts.json` alone would seal the live HOST
+ * session (`session-15f80d86-…`, absent from posts.json) as
+ * "not a catalog incumbent" — a FALSE SEAL, and the measured reason this
+ * function takes both sources.
+ *
+ * HONEST DEGRADATION: a null/absent catalog (a generic, non-deepartments
+ * install — no posts.json at all) yields NO seal at all rather than
+ * "not a catalog incumbent": "I could not measure the catalog" must never be
+ * rendered as the positive claim "this session is not a member" (the day's
+ * lesson, fb-2400). An EMPTY-but-present catalog is a measurement.
+ */
+export interface SessionSeal {
+  /** The session the seal describes. */
+  sessionId: string;
+  /** The renderable seal, appended to this session's label in the notice and in
+   *  the boot log. Computed here so the seal is ONE concept crossing the
+   *  boot.ts↔index.ts boundary (boot.ts stays pure/IO-free; index.ts owns the
+   *  file reads). */
+  label: string;
+  /** Seat the session currently occupies (`postId` of the row whose `sessionId`
+   *  is this session), when any row lists it. */
+  seat?: string;
+  /** True when that seat's row lists this session AND the row is not retired. */
+  current?: boolean;
+  /** For a session a row lists as its `previousChildId`/`previousSessionId`:
+   *  the session that SUPERSEDED it (the seat's current holder). */
+  supersededBy?: string;
+  /** Which document resolved the seat ('posts'|'hosts'); absent when not listed. */
+  listedIn?: 'posts' | 'hosts';
+}
+
+/** One catalog row as the seal resolver reads it (both documents normalize). */
+interface SeatRow {
+  seat: string
+  sessionId?: string
+  previous?: string
+  retired: boolean
+  listedIn: 'posts' | 'hosts'
+}
+
+/**
+ * Parse ONE catalog document into seal rows. Returns null — never throws — when
+ * the document is absent (a `null` raw is "not measured") or malformed: a
+ * corrupt catalog must not crash a boot notice, and must NOT be reported as an
+ * empty roster (the "not measured ≠ not a member" rule).
+ */
+function parseSeatRows(raw: string | null, listedIn: 'posts' | 'hosts'): SeatRow[] | null {
+  if (raw === null || raw.trim() === '') return null
+  let data: unknown
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) return null
+  const rows: SeatRow[] = []
+  for (const [seat, entry] of Object.entries(data as Record<string, unknown>)) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const e = entry as { sessionId?: unknown; previousChildId?: unknown; previousSessionId?: unknown; retired?: unknown }
+    const previous =
+      typeof e.previousChildId === 'string' && e.previousChildId.length > 0
+        ? e.previousChildId
+        : typeof e.previousSessionId === 'string' && e.previousSessionId.length > 0
+          ? e.previousSessionId
+          : undefined
+    rows.push({
+      seat,
+      sessionId: typeof e.sessionId === 'string' && e.sessionId.length > 0 ? e.sessionId : undefined,
+      previous,
+      retired: e.retired === true,
+      listedIn,
+    })
+  }
+  return rows
+}
+
+/**
+ * Resolve the seat seal of every given session from the catalog documents.
+ *
+ * PRECEDENCE per session (first match wins):
+ *  1. a CURRENT listing — a row whose `sessionId` IS this session
+ *     (`[seat <postId>]`, or `(retired post)` when that row is retired);
+ *  2. an EXPLICIT supersession — a row naming this session as its
+ *     `previousChildId`/`previousSessionId`;
+ *  3. an ID-DERIVED supersession — a row whose SEAT NAME this session's id
+ *     embeds (`<kind>-<postId>-<uuid>`, the deepartments convention this module
+ *     already relies on for `ignoredSessionPrefixes`) while the row lists a
+ *     DIFFERENT session. Measured necessity: the live `quality-head` row
+ *     records NO `previousChildId`, so path 2 alone leaves the exact case of
+ *     this fiche (fb-2418) unsealed; a session id that names the seat while the
+ *     seat lists another session IS the rotated-out predecessor, and the row's
+ *     `sessionId` is its superseder. A row with NO `sessionId` cannot assert a
+ *     supersession, so it resolves as the seat's listing.
+ * Returns `[]` when NEITHER document could be read (unmeasured — no seal is
+ * fabricated; see the interface note above); a session inside a measured
+ * catalog that no path accounts for is sealed explicitly (→ "not a catalog
+ * incumbent").
+ */
+export function resolveSessionSeals(
+  sessionIds: readonly string[],
+  catalog: { postsRaw: string | null; hostsRaw: string | null },
+): SessionSeal[] {
+  const posts = parseSeatRows(catalog.postsRaw, 'posts')
+  const hosts = parseSeatRows(catalog.hostsRaw, 'hosts')
+  if (posts === null && hosts === null) return []
+  const ordered = [...(posts ?? []), ...(hosts ?? [])]
+  return sessionIds.map((sessionId) => {
+    const seal = sealOf(sessionId, ordered)
+    return { sessionId, ...seal, label: renderSeal(seal) }
+  })
+}
+
+/** The seat fields of one session (no renderable label — see `renderSeal`). */
+function sealOf(
+  sessionId: string,
+  ordered: readonly SeatRow[],
+): Omit<SessionSeal, 'sessionId' | 'label'> {
+  const current = ordered.find((r) => r.sessionId === sessionId)
+  if (current) {
+    return { seat: current.seat, current: !current.retired, listedIn: current.listedIn }
+  }
+  const predecessor = ordered.find((r) => r.previous === sessionId)
+  if (predecessor) {
+    return {
+      seat: predecessor.seat,
+      current: false,
+      ...(predecessor.sessionId !== undefined ? { supersededBy: predecessor.sessionId } : {}),
+      listedIn: predecessor.listedIn,
+    }
+  }
+  const derived = ordered.find(
+    (r) =>
+      embeddingSeats(sessionId).includes(r.seat) &&
+      r.sessionId !== undefined &&
+      r.sessionId !== sessionId,
+  )
+  if (derived) {
+    return {
+      seat: derived.seat,
+      current: false,
+      supersededBy: derived.sessionId,
+      listedIn: derived.listedIn,
+    }
+  }
+  return {}
+}
+
+/**
+ * Render one seal for the notice: a compact, attributable suffix appended to
+ * the session's label. The incumbent reads `[seat <postId>]`; a superseded
+ * session names the seat AND the session that replaced it (the discriminator
+ * the live notice lacked); a session no measured catalog row accounts for reads
+ * `[not a catalog incumbent]` — the seal that makes an outgoing emitter's
+ * presence legible WITHOUT suppressing it.
+ */
+function renderSeal(seal: Omit<SessionSeal, 'sessionId' | 'label'>): string {
+  if (seal.seat === undefined) return '[not a catalog incumbent]'
+  if (seal.supersededBy !== undefined) {
+    return `[seat ${seal.seat} superseded by ${seal.supersededBy}]`
+  }
+  return seal.current === true ? `[seat ${seal.seat}]` : `[seat ${seal.seat} (retired post)]`
+}
+
+/** The seat names a deepartments session id can embed: `<kind>-<seat>-<uuid>`. */
+function embeddingSeats(sessionId: string): string[] {
+  const seats: string[] = []
+  const marker = /^(?:head|worker)-(.+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(
+    sessionId,
+  )
+  if (marker) seats.push(marker[1])
+  return seats
+}
