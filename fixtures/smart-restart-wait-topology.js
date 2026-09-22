@@ -353,6 +353,19 @@ function lastWaitStartCap(log) {
   return caps.length === 0 ? null : caps[caps.length - 1]
 }
 
+/** The tool's (B-2) GRACE line, parsed:
+ *  `post-canary re-check: the canary window alone spent the wait budget —
+ *   granting the re-check a bounded grace of Nms (max(0, waitMaxMs Cms −
+ *   Gms waited at the guard)); total waiting never exceeds waitMaxMs`. */
+function parseGraceLine(log) {
+  const m =
+    /post-canary re-check: the canary window alone spent the wait budget — granting the re-check a bounded grace of (\d+)ms \(max\(0, waitMaxMs (\d+)ms − (\d+)ms waited at the guard\)\); total waiting never exceeds waitMaxMs/.exec(
+      log,
+    )
+  if (!m) return null
+  return { graceMs: Number(m[1]), cap: Number(m[2]), guard: Number(m[3]) }
+}
+
 const FB168_REFUSAL =
   'refusing to restart: 1 other session(s) mid-turn (worker-w1) — pass force:true to override'
 
@@ -482,10 +495,18 @@ const FB168_REFUSAL =
 
   const recheck = parseRecheckLine(log) // {cap, waited, canaryWindow, spent, left}
   const recheckCap = lastWaitStartCap(log)
+  // (B-2) The grace this scenario exercises: the canary window alone spends the
+  // budget, the guard left part of it unused, and the re-check receives that
+  // unspent share so the release INSIDE it still lets the restart PROCEED.
+  const grace = parseGraceLine(log)
   console.log(
     `BUDGET:total cap=${CAP}ms guard=${recheck?.waited}ms canaryWindow=${recheck?.canaryWindow}ms spent=${recheck?.spent}ms ` +
       `recheckCap=${recheckCap}ms recheckLeft=${recheck?.left}ms waitedMs=${res.waitedMs}ms wall=${windowMs}ms ` +
-      `=> waitedMs<=cap:${typeof res.waitedMs === 'number' && res.waitedMs <= CAP}`,
+      `=> waitedMs<=cap:${typeof res.waitedMs === 'number' && res.waitedMs <= CAP} ` +
+      // (B-2) APPENDED at the END on purpose: the published prefix is byte-
+      // identical to the pre-grace line, so the existing consumer regex of this
+      // line (test/wait.test.js) keeps matching without being touched.
+      `grace=${grace?.graceMs}ms guardPlusRecheckCap=${(recheck?.waited ?? 0) + (recheckCap ?? 0)}ms graceApplied=${grace !== null}`,
   )
 
   check('canary-budget-restart-proceeds', res.ok === true && res.restarting === true && res.canary === 'passed', JSON.stringify(res))
@@ -527,6 +548,39 @@ const FB168_REFUSAL =
     `waitedMs=${res.waitedMs} guard=${recheck?.waited} recheckLeft=${recheck?.left} (the outcome carries guard + re-check)`,
   )
   check('canary-budget-passive', listCalls === 4 && otherAgentCalls.length === 0, `${listCalls} list / ${otherAgentCalls.join(',')}`)
+  // ⭐ (B-2) THE GRACE PATH — the coverage the fix adds. When the canary window
+  // ALONE spends the budget (`left === 0`) the re-check does NOT get a
+  // zero-length wait: it disposes of the GUARD'S UNSPENT SHARE (`cap − guard`),
+  // which is exactly what the canary window ate — and because worker-w2 releases
+  // INSIDE that grace, the restart PROCEEDS (the path that used to be impossible:
+  // before the fix this scenario blocked and never spawned the kill).
+  check(
+    'canary-budget-grace-keeps-proceed-path',
+    res.ok === true &&
+      res.restarting === true &&
+      kills.length === killsBefore + 1 &&
+      recheck !== null &&
+      recheck.left === 0 &&
+      grace !== null &&
+      grace.graceMs > 0 &&
+      grace.graceMs === Math.max(0, CAP - recheck.waited) &&
+      recheckCap === grace.graceMs,
+    `ok=${res.ok} left=${recheck?.left} grace=${JSON.stringify(grace)} recheckCap=${recheckCap} (the re-check cap IS the grace, and the release inside it proceeds)`,
+  )
+  // The grace line names its OWN derivation (no `left>0` lie above it): the
+  // published `left` stays 0 and the grace is `cap − guard`, never a fresh cap.
+  check(
+    'canary-budget-grace-line-derivation',
+    grace !== null && grace.cap === CAP && grace.guard === recheck?.waited && /0ms left/.test(log),
+    `grace=${JSON.stringify(grace)} guard=${recheck?.waited} (the spent budget is stated as 0ms left AND the grace names min/max arithmetic)`,
+  )
+  // The INVARIANT, by construction: WAITING (guard + the re-check's granted cap)
+  // never exceeds the cap — the grace path makes it EXACTLY the cap.
+  check(
+    'canary-budget-grace-invariant-guard-plus-recheck',
+    recheck !== null && recheck.waited + recheckCap <= CAP && typeof res.waitedMs === 'number' && res.waitedMs <= CAP,
+    `guard=${recheck?.waited} recheckCap=${recheckCap} sum=${(recheck?.waited ?? 0) + (recheckCap ?? 0)} cap=${CAP} waitedMs=${res.waitedMs} (guard + re-check ≤ cap ALWAYS)`,
+  )
 }
 
 // --- 8. TRAMO (B) — the canary window spends the WHOLE budget: the re-check
@@ -568,6 +622,20 @@ const FB168_REFUSAL =
   check('canary-exhausted-no-spawn', killLines().length === killsBefore, `kills ${killLines().length}`)
   check('canary-exhausted-no-partial-action', JSON.stringify(pending()) === pendingBefore && JSON.stringify(marker()) === markerBefore, 'a refused re-check must persist nothing')
   check('canary-exhausted-passive', listCalls === 4 && otherAgentCalls.length === 0, `${listCalls} list / ${otherAgentCalls.join(',')}`)
+  // ⭐ (B-2) ZERO GRACE = TODAY, BYTE-IDENTICAL. Here the GUARD itself spent the
+  // whole cap (`guard === CAP`), so `cap − guard === 0`: no grace is granted, NO
+  // grace line is published, and the refusal is exactly the pre-fix one — the
+  // "no zero-length wait" immediate decision on the CURRENT state. This is the
+  // edge the grace must NOT disturb.
+  check(
+    'canary-exhausted-zero-grace-unchanged',
+    recheck !== null &&
+      recheck.waited >= CAP &&
+      parseGraceLine(log) === null &&
+      /refusing now \(no zero-length wait\)/.test(log) &&
+      !/granting the re-check a bounded grace/.test(log),
+    `guard=${recheck?.waited} cap=${CAP} graceLine=${JSON.stringify(parseGraceLine(log))} (guard consumed the cap → nothing to grant, no zero-length wait)`,
+  )
 }
 
 // --- 9. TRAMO (B) — the re-check spends its REMAINDER and the sessions never
@@ -590,9 +658,11 @@ const FB168_REFUSAL =
   await settle()
   const log = warnLines.join('\n')
   const recheck = parseRecheckLine(log)
+  const grace = parseGraceLine(log)
   console.log(
     `BUDGET:recheck-timeout cap=${CAP}ms guard=${recheck?.waited}ms canaryWindow=${recheck?.canaryWindow}ms spent=${recheck?.spent}ms ` +
-      `recheckLeft=${recheck?.left}ms waitedMs=${res.waitedMs}ms wall=${windowMs}ms`,
+      `recheckLeft=${recheck?.left}ms waitedMs=${res.waitedMs}ms wall=${windowMs}ms ` +
+      `grace=${grace?.graceMs}ms guardPlusGrace=${(recheck?.waited ?? 0) + (grace?.graceMs ?? 0)}ms`,
   )
   check(
     'canary-recheck-timeout-same-refusal',
@@ -616,6 +686,30 @@ const FB168_REFUSAL =
     'canary-recheck-timeout-passive',
     listCalls >= 3 && listCalls <= 8 && otherAgentCalls.length === 0,
     `${listCalls} list / ${otherAgentCalls.join(',')}`,
+  )
+  // ⭐ (B-2) THE GRACE THAT TIMES OUT — the other half of the new path: the
+  // canary window spends the budget alone (`left === 0`), the guard left part of
+  // it unused (so a grace > 0 exists), the re-check SPENDS that grace and
+  // worker-w2 NEVER releases → the SAME loud refusal with the accumulated wait,
+  // and the accumulated total is EXACTLY the cap (guard + grace), never more.
+  check(
+    'canary-recheck-timeout-grace-granted-and-spent',
+    grace !== null &&
+      grace.graceMs > 0 &&
+      grace.graceMs === Math.max(0, CAP - (recheck?.waited ?? 0)) &&
+      recheck?.left === 0 &&
+      typeof res.waitedMs === 'number' &&
+      res.waitedMs >= recheck.waited + Math.min(1_000, grace.graceMs) &&
+      res.waitedMs <= CAP,
+    `grace=${JSON.stringify(grace)} guard=${recheck?.waited} left=${recheck?.left} waitedMs=${res.waitedMs} cap=${CAP}`,
+  )
+  // The INVARIANT by construction (the grace path is the tight one):
+  // guard + recheck == cap exactly, so `waitedMs ≤ waitMaxMs` can never be
+  // broken by a millisecond of timer jitter on either stage.
+  check(
+    'canary-recheck-timeout-grace-invariant-exact',
+    recheck !== null && grace !== null && recheck.waited + grace.graceMs === CAP && res.waitedMs <= CAP,
+    `guard=${recheck?.waited} + grace=${grace?.graceMs} = ${(recheck?.waited ?? 0) + (grace?.graceMs ?? 0)} (cap ${CAP}) waitedMs=${res.waitedMs}`,
   )
 }
 

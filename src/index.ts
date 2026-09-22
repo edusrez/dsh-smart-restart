@@ -873,12 +873,12 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           wait: {
             type: 'boolean',
             description:
-              'Optional: DEFER instead of refusing — re-read the LIVE agent registry (the same in-process snapshot the guard uses; it never sends a message or wakes anyone) until every OTHER session is idle, then restart. Bounded by `waitMaxMs`; when the cap is spent the tool returns the SAME loud in-flight refusal and states that the wait expired (no partial action, nothing is spawned). A canary gate shares that same budget (its post-canary re-check gets only the remaining time and refuses immediately once nothing is left), so a spent wait is never silent. `force:true` wins and skips the wait entirely.',
+              'Optional: DEFER instead of refusing — re-read the LIVE agent registry (the same in-process snapshot the guard uses; it never sends a message or wakes anyone) until every OTHER session is idle, then restart. Bounded by `waitMaxMs`: the wait at the guard and, when a canary gate runs, its post-canary re-check share one budget, so a spent budget is never silent — when it is exhausted the tool returns the SAME loud in-flight refusal and states that the wait expired (no partial action, nothing is spawned). If the canary window alone spends the budget while the guard left part of it unused, the re-check still disposes of that unspent share as a bounded grace (the WAITING total never exceeds `waitMaxMs`); only with a zero grace does it refuse immediately. `force:true` wins and skips the wait entirely.',
           },
           waitMaxMs: {
             type: 'number',
             description:
-              'Optional: hard cap in milliseconds on a `wait:true` deferral (default 120000 = 2 minutes). Ignored without `wait:true`; an absent/invalid value falls back to the default, so a wait never runs unbounded. An explicit 0 (or a value <= 0) is NOT the default: it spends no budget, so a restart blocked by another mid-turn session refuses IMMEDIATELY — the same loud in-flight refusal, reporting only the few ms that elapsed (never 120000) — use a positive cap for a short deferral. It caps the WHOLE deferral: the `wait` at the guard AND, when a canary gate runs, its post-canary re-check draw from the same budget (the re-check gets only what is left; with nothing left it refuses immediately), and `waitedMs` reports the accumulated total — the deferral can never last 2x this cap.',
+              'Optional: hard cap in milliseconds on a `wait:true` deferral (default 120000 = 2 minutes). Ignored without `wait:true`; an absent/invalid value falls back to the default, so a wait never runs unbounded. An explicit 0 (or a value <= 0) is NOT the default: it spends no budget, so a restart blocked by another mid-turn session refuses IMMEDIATELY — the same loud in-flight refusal, reporting only the few ms that elapsed (never 120000) — use a positive cap for a short deferral. It caps the WAITING: the `wait` at the guard AND, when a canary gate runs, its post-canary re-check draw from the same budget, so `waitedMs` (the ACCUMULATED guard + re-check wait) never exceeds this cap — never 2x. The CANARY WINDOW itself is charged against the budget while any is left (the re-check then gets only what remains); when that window alone spends the budget, the re-check receives a bounded GRACE = the cap minus what the guard actually waited (the guard unspent share the canary window consumed), so the total WAITING still never exceeds the cap. The canary window is NOT capped by this value: it keeps its own measured budget (CANARY_CAPTURE_BUDGET_MS), because a short `waitMaxMs` must never blind the capture (fb-2309).',
           },
         },
         output: {
@@ -959,13 +959,27 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           // POST-wait state. The wait is passive: it never creates a turn,
           // never wakes anyone and touches no messaging surface.
           //
-          // (B) — `waitMaxMs` is the budget of the WHOLE deferral, not of each
-          // wait stage: the guard-stage wait below AND the post-canary
-          // re-check draw from the SAME cap, and the re-check gets only
-          // `waitMaxMs - spent`. Without that, a wait that saw the registry
-          // idle and then burned its budget in the canary window would
-          // reproduce — inside the very tool that exists to kill it — the
-          // fb-677/fb-694 defect: the window closes WHILE it is being checked.
+          // (B) — `waitMaxMs` is the budget of the WAITING, not of each wait
+          // stage: the guard-stage wait below AND the post-canary re-check draw
+          // from the SAME cap, and the re-check gets only `waitMaxMs - spent`
+          // (the canary window is charged against the budget while any is left).
+          // Without that, a wait that saw the registry idle and then burned its
+          // budget in the canary window would reproduce — inside the very tool
+          // that exists to kill it — the fb-677/fb-694 defect: the window closes
+          // WHILE it is being checked.
+          //
+          // (B-2) — THE GRACE, because the canary window is NOT capped by this
+          // budget (it keeps its own measured budget: truncating it to a short
+          // `waitMaxMs` would blind the capture and abort a healthy tree —
+          // fb-2309): when the canary window alone spends the budget, the
+          // re-check still receives the GUARD's unspent share (`waitMaxMs -
+          // waitedMs-at-guard`) as a bounded grace — that share is exactly what
+          // the window consumed. The INVARIANT is about the WAITING:
+          // `waitedMs` = guard + re-check ≤ `waitMaxMs` ALWAYS (the normal path
+          // gives guard + (cap − spent) ≤ cap; the grace path gives
+          // guard + (cap − guard) = cap). The canary window may exceed the cap;
+          // the WAIT never does. With a zero grace the behavior is unchanged:
+          // decide on the current state, never a zero-length wait.
           // Invariant: either the restart happens, or a LOUD refusal — never a
           // wait silently spent.
           const force = args.force === true
@@ -975,6 +989,19 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
           // a message, a wake, a queue or a turn.
           const readLiveAgents = (): { id: unknown; status: string }[] =>
             ctx.agents.list().map((a) => ({ id: a.id, status: a.status }))
+          /**
+           * The ACCOUNTED wait of ONE stage: what a stage may charge to the
+           * shared budget is bounded by the cap IT was granted. `waitForIdle`
+           * measures its own elapsed time and a `setTimeout` can overshoot its
+           * deadline by a few ms, so the RAW figure may exceed its cap — and two
+           * raw figures accumulated could then publish `waitedMs > waitMaxMs`.
+           * Accounting the `min()` makes the invariant `waitedMs ≤ waitMaxMs`
+           * hold BY CONSTRUCTION rather than by luck: the stage stopped AT its
+           * cap (spending the budget is the ceiling, never a suggestion), so the
+           * accounted figure is the real deferral the budget pays for.
+           */
+          const accountedWaitMs = (measuredMs: number, capMs: number): number =>
+            Math.min(Math.max(0, measuredMs), Math.max(0, capMs))
           let waited: WaitForIdleResult | undefined
           /** The effective `waitMaxMs` of this call (0 when `wait` is not armed). */
           let waitBudgetMs = 0
@@ -996,6 +1023,12 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
               sleep: sleepMs,
               onLog: (line) => console.warn(`[smart-restart] smart_restart: ${line}`),
             })
+            // Account the guard stage against ITS OWN granted cap (the whole
+            // budget): it stopped AT the cap, so it can never charge more than
+            // the cap to the shared budget — the invariant `waitedMs ≤
+            // waitMaxMs` then holds by construction even though a `setTimeout`
+            // may overshoot its deadline by a few ms.
+            waited = { ...waited, waitedMs: accountedWaitMs(waited.waitedMs, waitBudgetMs) }
             if (!waited.idle) {
               // The cap is spent and sessions are still mid-turn: the SAME
               // loud refusal as the immediate block, stating the expiry. No
@@ -1079,22 +1112,68 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
                   `${Math.round(waited.waitedMs)}ms waited at the guard, ${canaryWindowMs}ms canary window, ` +
                   `${Math.round(spentMs)}ms spent so far → ${Math.round(remainingMs)}ms left`,
               )
-              if (remainingMs > 0) {
+              // (B-2) THE GRACE — the canary window can spend the budget ALONE.
+              //
+              // The published arithmetic above stays untouched: the budget IS
+              // spent (`remainingMs === 0`, logged as `0ms left`). But the two
+              // consumers of the deferral are NOT the same: `remainingMs` charges
+              // the canary window against the WHOLE cap, while the GUARD is the
+              // other consumer and it may have left part of the cap unused. That
+              // unspent guard share (`waitMaxMs - waited.waitedMs`) is exactly
+              // what the canary window ate — so when the canary alone exhausts
+              // the budget, the re-check receives that share as a BOUNDED GRACE.
+              //
+              // WHY NOT A ZERO-LENGTH (or truncated-canary) WAIT: on a REAL tree
+              // the `dsh web:` line lands at T+12.4-12.9s (CANARY_CAPTURE_BUDGET_MS
+              // = 20000), so truncating the capture to a short `waitMaxMs` would
+              // leave it blind (no cookie → 401 on a 0.1.5 auth-wall tree → the
+              // canary would abort the restart of a HEALTHY tree): the fb-2309
+              // class. Refusing immediately instead would recreate the
+              // fb-677/fb-694 defect INSIDE the tool that exists to kill it: a
+              // window that closed WHILE it was being checked, with the guard's
+              // own unspent budget thrown away.
+              //
+              // INVARIANT (by construction): `waitedMs` (guard + re-check) ≤
+              // `waitMaxMs`. Normal path: guard + (cap - spent) ≤ cap - canaryW.
+              // Grace path: guard + (cap - guard) = cap. When the grace is 0 the
+              // behavior is BYTE-IDENTICAL to the pre-grace code (decide on the
+              // CURRENT state, no zero-length wait).
+              const graceMs = remainingMs > 0 ? 0 : Math.max(0, waitBudgetMs - waited.waitedMs)
+              const recheckCapMs = remainingMs > 0 ? remainingMs : graceMs
+              if (recheckCapMs > 0) {
+                if (graceMs > 0) {
+                  // HONEST, TWO FACTS: the line above still says the wait budget
+                  // is spent (it is), and this one names the grace AND its
+                  // derivation — never a `left>0` where the arithmetic says 0.
+                  console.warn(
+                    `[smart-restart] smart_restart: post-canary re-check: the canary window alone spent the wait budget — ` +
+                      `granting the re-check a bounded grace of ${Math.round(graceMs)}ms ` +
+                      `(max(0, waitMaxMs ${waitBudgetMs}ms − ${Math.round(waited.waitedMs)}ms waited at the guard)); ` +
+                      `total waiting never exceeds waitMaxMs`,
+                  )
+                }
                 // The SAME `waitForIdle` (same reader, same caller exclusion,
-                // same passivity): only the cap differs — the remainder.
+                // same passivity): only the cap differs — the remainder, or the
+                // grace when the canary window consumed the whole remainder.
                 const reWaited = await waitForIdle({
                   readAgents: readLiveAgents,
                   callingSessionId: guard.sessionId,
-                  maxMs: remainingMs,
+                  maxMs: recheckCapMs,
                   sleep: sleepMs,
                   onLog: (line) => console.warn(`[smart-restart] smart_restart: ${line}`),
                 })
+                // The re-check can charge the shared budget only what IT was
+                // granted (`min(measured, recheckCapMs)`): with the grace that is
+                // `cap − guard` by definition, so guard + re-check = cap exactly;
+                // on the normal path it is `cap − spent`, so guard + re-check
+                // ≤ cap − canaryWindow.
+                const recheckShare = accountedWaitMs(reWaited.waitedMs, recheckCapMs)
                 if (!reWaited.idle) {
                   // The budget is spent and sessions are still mid-turn: the
                   // SAME loud refusal (in-flight list + the expiry sentence),
-                  // with the ACCUMULATED wait. No partial action, nothing
-                  // spawned, nothing persisted.
-                  const totalMs = waited.waitedMs + reWaited.waitedMs
+                  // with the ACCUMULATED wait (bounded — see `recheckShare`).
+                  // No partial action, nothing spawned, nothing persisted.
+                  const totalMs = waited.waitedMs + recheckShare
                   console.warn(
                     `[smart-restart] smart_restart: BLOCKED at the post-canary re-check — ` +
                       `${reWaited.inFlight.length} other session(s) mid-turn: ${reWaited.inFlight.join(', ')}; ` +
@@ -1111,7 +1190,7 @@ export function apply(ctx: Context, cfg: Partial<Config> = {}) {
                 }
                 // Honest accounting: the outcome carries the ACCUMULATED wait
                 // (guard stage + re-check), not just the last stage.
-                waited = { ...waited, waitedMs: waited.waitedMs + reWaited.waitedMs }
+                waited = { ...waited, waitedMs: waited.waitedMs + recheckShare }
               } else {
                 // Nothing left to wait with: decide on the CURRENT state
                 // immediately (never a zero-length wait).
